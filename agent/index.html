@@ -118,7 +118,6 @@
 
     // ===== Firebaseコマンド監視 =====
     const lockScreen = document.getElementById("lock-screen");
-    const lockTimeEl = document.getElementById("lock-time");
     const msgBanner = document.getElementById("msg-banner");
 
     // タイムスタンプは localStorage で永続化（ページリロード後も再実行しない）
@@ -130,9 +129,7 @@
     const STALE_MS = 30 * 1000;        // 30秒より古い命令は無視
 
     // ===== ロック制御（全画面・キー制限・状態の永続化） =====
-    const LOCK_KEY = "agent_locked", LOCK_MSG_KEY = "agent_lock_msg";
-    const DEFAULT_LOCK_MSG = "このパソコンは管理者によってロックされています。";
-    const lockHint = document.getElementById("lock-hint");
+    const LOCK_KEY = "agent_locked";
     const isLocked = () => lockScreen.style.display === "flex";
 
     async function enterFullscreen() {
@@ -140,35 +137,25 @@
         if (!document.fullscreenElement) await document.documentElement.requestFullscreen({ navigationUI: "hide" });
       } catch {}
       try { if (navigator.keyboard && navigator.keyboard.lock) await navigator.keyboard.lock(); } catch {}
-      updateLockHint();
     }
     function exitFullscreen() {
       try { if (navigator.keyboard && navigator.keyboard.unlock) navigator.keyboard.unlock(); } catch {}
       try { if (document.fullscreenElement) document.exitFullscreen(); } catch {}
     }
-    function updateLockHint() {
-      lockHint.style.display = (isLocked() && !document.fullscreenElement) ? "block" : "none";
-    }
     function applyLock(on, msg) {
       if (on) {
-        const m = msg || DEFAULT_LOCK_MSG;
         lockScreen.style.display = "flex";
-        document.getElementById("lock-msg").textContent = m;
         localStorage.setItem(LOCK_KEY, "1");
-        localStorage.setItem(LOCK_MSG_KEY, m);
         history.pushState(null, "", location.href);
         enterFullscreen();
       } else {
         lockScreen.style.display = "none";
         localStorage.removeItem(LOCK_KEY);
-        localStorage.removeItem(LOCK_MSG_KEY);
         exitFullscreen();
       }
-      updateLockHint();
     }
     // ロック画面をクリック → 全画面に戻す（ユーザー操作が必要なため）
     lockScreen.addEventListener("click", enterFullscreen);
-    document.addEventListener("fullscreenchange", updateLockHint);
     document.addEventListener("visibilitychange", () => { if (isLocked()) enterFullscreen(); });
     // ロック中はキー操作・右クリックを無効化
     window.addEventListener("keydown", e => { if (isLocked()) { e.preventDefault(); e.stopPropagation(); } }, true);
@@ -176,15 +163,8 @@
 
     // 前回ロック中だったなら、Firebase応答を待たずに即ロック（再起動・オフラインでも解除されない）
     if (localStorage.getItem(LOCK_KEY) === "1") {
-      applyLock(true, localStorage.getItem(LOCK_MSG_KEY));
+      applyLock(true);
     }
-
-    // ロック時計
-    setInterval(() => {
-      if (lockScreen.style.display === "flex") {
-        lockTimeEl.textContent = new Date().toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
-      }
-    }, 1000);
 
     onValue(ref(db, `devices/${deviceId}`), snap => {
       const data = snap.val();
@@ -208,9 +188,7 @@
 
       // ===== ロックダウン =====
       if (data.locked) {
-        if (!isLocked() || document.getElementById("lock-msg").textContent !== (data.lockMessage || DEFAULT_LOCK_MSG)) {
-          applyLock(true, data.lockMessage);
-        }
+        if (!isLocked()) applyLock(true);
       } else if (isLocked()) {
         applyLock(false);
       }
@@ -363,15 +341,9 @@
     #lock-screen {
       display: none; position: fixed; inset: 0; background: #000;
       flex-direction: column; align-items: center; justify-content: center;
-      z-index: 99999; text-align: center; padding: 40px; user-select: none;
-      pointer-events: all;
+      z-index: 99999; user-select: none; pointer-events: all; cursor: none;
     }
-    #lock-hint { display: none; position: absolute; bottom: 28px; left: 0; right: 0; font-size: 13px; color: rgba(255,255,255,.45); }
-    .lock-icon { font-size: 72px; margin-bottom: 16px; animation: pulse 2s infinite; }
     @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.6} }
-    #lock-time { font-size: 52px; font-weight: 700; color: #fff; margin-bottom: 10px; font-variant-numeric: tabular-nums; letter-spacing: 2px; }
-    #lock-msg { font-size: 18px; font-weight: 600; color: rgba(255,255,255,.85); max-width: 500px; line-height: 1.6; margin-top: 10px; }
-
     /* ===== メッセージバナー ===== */
     #msg-banner {
       display: none; position: fixed; top: 0; left: 0; right: 0;
@@ -458,12 +430,7 @@
 </div>
 
 <!-- ロック画面（最前面） -->
-<div id="lock-screen">
-  <div class="lock-icon">🔒</div>
-  <div id="lock-time">--:--:--</div>
-  <div id="lock-msg">このパソコンは管理者によってロックされています。</div>
-  <div id="lock-hint">画面をクリックすると全画面に戻ります</div>
-</div>
+<div id="lock-screen"></div>
 
 <!-- エージェントカード -->
 <div class="card">
