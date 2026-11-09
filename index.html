@@ -1,0 +1,1271 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PC管理コンソール v3</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+    import { getDatabase, ref, onValue, remove, set, update, push, get } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-database.js";
+
+    const firebaseConfig = {
+      apiKey: "AIzaSyDp06yKrhhvRypue_iCfTzfqCbQEB9mCY4",
+      authDomain: "lock-71e17.firebaseapp.com",
+      databaseURL: "https://lock-71e17-default-rtdb.asia-southeast1.firebasedatabase.app",
+      projectId: "lock-71e17",
+      storageBucket: "lock-71e17.firebasestorage.app",
+      messagingSenderId: "176191347557",
+      appId: "1:176191347557:web:4a1621147d60075f049f8c"
+    };
+
+    const app = initializeApp(firebaseConfig);
+    const db = getDatabase(app);
+
+    const ADMIN_PASSWORD = "admin1234";
+
+    let allDevices = {};
+    let currentFilter = "all";
+    let searchQuery = "";
+    let selectedId = null;
+    let currentTab = "info";
+    let viewMode = "grid"; // grid | list
+    let activityLog = [];
+    let scheduledTasks = [];
+    let pingTimers = {};
+
+    // ===== ログイン =====
+    const loginScreen = document.getElementById("login-screen");
+    const mainScreen = document.getElementById("main-screen");
+
+    document.getElementById("login-btn").addEventListener("click", () => {
+      const pw = document.getElementById("password-input").value;
+      if (pw === ADMIN_PASSWORD) {
+        loginScreen.style.display = "none";
+        mainScreen.style.display = "flex";
+        initApp();
+      } else {
+        const err = document.getElementById("login-error");
+        err.textContent = "パスワードが違います";
+        document.getElementById("password-input").classList.add("shake");
+        setTimeout(() => document.getElementById("password-input").classList.remove("shake"), 500);
+      }
+    });
+    document.getElementById("password-input").addEventListener("keydown", e => {
+      if (e.key === "Enter") document.getElementById("login-btn").click();
+    });
+
+    function initApp() {
+      requestNotificationPermission();
+      loadScheduledTasks();
+
+      onValue(ref(db, "devices"), snap => {
+        const prev = { ...allDevices };
+        allDevices = snap.val() || {};
+
+        Object.entries(allDevices).forEach(([id, d]) => {
+          const wasOnline = prev[id] ? isOnline(prev[id].lastSeen) : false;
+          const nowOnline = isOnline(d.lastSeen);
+          if (!prev[id] && nowOnline) {
+            showToast(`🟢 ${d.label || id} が接続しました`, "success");
+            addLog("connect", id, d.label || id, "オンラインになりました");
+          } else if (wasOnline && !nowOnline) {
+            showToast(`🔴 ${d.label || id} がオフラインになりました`, "warn");
+            addLog("disconnect", id, d.label || id, "オフラインになりました");
+          }
+        });
+
+        renderDevices();
+        updateStats();
+        if (selectedId && allDevices[selectedId]) renderDetail(selectedId);
+        checkScheduledTasks();
+      });
+
+      onValue(ref(db, "groups"), snap => {
+        renderGroupFilter(snap.val() || {});
+      });
+
+      setInterval(updateRelativeTimes, 15000);
+      setInterval(checkScheduledTasks, 30000);
+    }
+
+    // ===== ユーティリティ =====
+    function isOnline(ts) { return Date.now() - ts < 2 * 60 * 1000; }
+
+    function timeSince(ts) {
+      const d = Math.floor((Date.now() - ts) / 1000);
+      if (d < 60) return `${d}秒前`;
+      if (d < 3600) return `${Math.floor(d / 60)}分前`;
+      if (d < 86400) return `${Math.floor(d / 3600)}時間前`;
+      return `${Math.floor(d / 86400)}日前`;
+    }
+
+    function formatTime(ts) {
+      return new Date(ts).toLocaleString("ja-JP", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" });
+    }
+
+    function updateRelativeTimes() {
+      document.querySelectorAll("[data-ts]").forEach(el => {
+        el.textContent = timeSince(parseInt(el.dataset.ts));
+      });
+    }
+
+    // ===== 通知 =====
+    function requestNotificationPermission() {
+      if ("Notification" in window && Notification.permission === "default") {
+        Notification.requestPermission();
+      }
+    }
+
+    function showToast(msg, type = "info") {
+      const area = document.getElementById("toast-area");
+      const n = document.createElement("div");
+      n.className = `toast toast-${type}`;
+      n.innerHTML = `<span>${msg}</span><button onclick="this.parentElement.remove()">×</button>`;
+      area.appendChild(n);
+      setTimeout(() => n.classList.add("toast-out"), 3500);
+      setTimeout(() => n.remove(), 4000);
+
+      if (type === "warn" && Notification.permission === "granted") {
+        new Notification("PC管理コンソール", { body: msg });
+      }
+    }
+
+    // ===== アクティビティログ =====
+    function addLog(type, id, label, msg) {
+      activityLog.unshift({ type, id, label, msg, ts: Date.now() });
+      if (activityLog.length > 200) activityLog.pop();
+      if (document.getElementById("log-panel").classList.contains("open")) renderLog();
+    }
+
+    function renderLog() {
+      const el = document.getElementById("log-list");
+      if (!activityLog.length) {
+        el.innerHTML = `<div class="log-empty">ログはありません</div>`;
+        return;
+      }
+      el.innerHTML = activityLog.map(l => `
+        <div class="log-row log-${l.type}">
+          <span class="log-icon">${l.type === "connect" ? "🟢" : l.type === "disconnect" ? "🔴" : l.type === "lock" ? "🔒" : l.type === "unlock" ? "🔓" : l.type === "msg" ? "💬" : l.type === "ping" ? "📡" : "📋"}</span>
+          <div class="log-content">
+            <span class="log-label">${l.label}</span>
+            <span class="log-msg">${l.msg}</span>
+          </div>
+          <span class="log-time">${timeSince(l.ts)}</span>
+        </div>
+      `).join("");
+    }
+
+    document.getElementById("log-toggle").addEventListener("click", () => {
+      const panel = document.getElementById("log-panel");
+      panel.classList.toggle("open");
+      if (panel.classList.contains("open")) renderLog();
+    });
+
+    document.getElementById("log-clear").addEventListener("click", () => {
+      activityLog = [];
+      renderLog();
+    });
+
+    // ===== グループフィルター =====
+    function renderGroupFilter(groups) {
+      const bar = document.getElementById("group-filter");
+      bar.innerHTML = `<button class="filter-btn ${currentFilter === "all" ? "active" : ""}" data-g="all">すべて</button>`;
+      Object.keys(groups).forEach(g => {
+        const btn = document.createElement("button");
+        btn.className = `filter-btn ${currentFilter === g ? "active" : ""}`;
+        btn.dataset.g = g;
+        const count = Object.values(allDevices).filter(d => d.group === g).length;
+        btn.innerHTML = `${g} <span class="filter-count">${count}</span>`;
+        bar.appendChild(btn);
+      });
+      bar.querySelectorAll(".filter-btn").forEach(btn => {
+        btn.addEventListener("click", () => {
+          currentFilter = btn.dataset.g;
+          bar.querySelectorAll(".filter-btn").forEach(b => b.classList.remove("active"));
+          btn.classList.add("active");
+          renderDevices();
+        });
+      });
+    }
+
+    // ===== 統計 =====
+    function updateStats() {
+      const total = Object.keys(allDevices).length;
+      const online = Object.values(allDevices).filter(d => isOnline(d.lastSeen)).length;
+      const locked = Object.values(allDevices).filter(d => d.locked).length;
+      document.getElementById("stat-total").textContent = total;
+      document.getElementById("stat-online").textContent = online;
+      document.getElementById("stat-locked").textContent = locked;
+      document.getElementById("stat-offline").textContent = total - online;
+    }
+
+    // ===== デバイス一覧 =====
+    function renderDevices() {
+      const grid = document.getElementById("device-grid");
+      grid.className = viewMode === "list" ? "device-list" : "device-grid";
+      grid.innerHTML = "";
+
+      const entries = Object.entries(allDevices).filter(([id, d]) => {
+        if (currentFilter !== "all" && d.group !== currentFilter) return false;
+        const q = searchQuery.toLowerCase();
+        if (q && !((d.label || id).toLowerCase().includes(q) ||
+          (d.os || "").toLowerCase().includes(q) ||
+          (d.ip || "").includes(q) ||
+          (d.group || "").toLowerCase().includes(q))) return false;
+        return true;
+      });
+
+      if (!entries.length) {
+        grid.innerHTML = `<div class="empty-state"><div class="empty-icon">🖥</div><div>デバイスが見つかりません</div></div>`;
+        return;
+      }
+
+      entries.sort((a, b) => {
+        const ao = isOnline(a[1].lastSeen) ? 0 : 1;
+        const bo = isOnline(b[1].lastSeen) ? 0 : 1;
+        return ao - bo || (a[1].label || a[0]).localeCompare(b[1].label || b[0]);
+      });
+
+      entries.forEach(([id, d]) => {
+        const alive = isOnline(d.lastSeen);
+        const locked = d.locked;
+        const hasMsg = !!d.pendingMessage;
+        const batteryVal = d.battery ?? null;
+
+        if (viewMode === "list") {
+          const row = document.createElement("div");
+          row.className = `list-row ${alive ? "online" : "offline"} ${locked ? "locked" : ""} ${selectedId === id ? "selected" : ""}`;
+          row.innerHTML = `
+            <span class="dot ${alive ? "dot-on" : "dot-off"}"></span>
+            <span class="list-name">${d.label || id}</span>
+            <span class="list-meta">${d.os || "不明"}</span>
+            <span class="list-meta">${d.ip || "—"}</span>
+            <span class="list-meta">${d.group || "未分類"}</span>
+            <div class="list-badges">
+              ${locked ? '<span class="badge badge-red">ロック</span>' : ''}
+              ${hasMsg ? '<span class="badge badge-blue">メッセージ</span>' : ''}
+              ${batteryVal !== null ? `<span class="badge badge-${batteryVal < 20 ? 'red' : 'muted'}">${batteryVal}%</span>` : ''}
+            </div>
+            <span class="list-time" data-ts="${d.lastSeen}">${timeSince(d.lastSeen)}</span>
+            <div class="list-actions">
+              <button class="icon-btn" data-action="lock" data-id="${id}" title="${locked ? 'ロック解除' : 'ロック'}">${locked ? '🔓' : '🔒'}</button>
+              <button class="icon-btn" data-action="ping" data-id="${id}" title="Ping">📡</button>
+            </div>
+          `;
+          row.addEventListener("click", (e) => {
+            if (!e.target.closest(".icon-btn")) openDetail(id);
+          });
+          grid.appendChild(row);
+        } else {
+          const card = document.createElement("div");
+          card.className = `card ${alive ? "online" : "offline"} ${locked ? "locked" : ""} ${selectedId === id ? "selected" : ""}`;
+          card.innerHTML = `
+            <div class="card-status-bar"></div>
+            <div class="card-body">
+              <div class="card-top">
+                <span class="dot ${alive ? "dot-on" : "dot-off"}"></span>
+                <span class="card-name">${d.label || id}</span>
+                <div class="card-badges">
+                  ${locked ? '<span class="badge badge-red">ロック</span>' : ''}
+                  ${hasMsg ? '<span class="badge badge-blue">📨</span>' : ''}
+                </div>
+              </div>
+              <div class="card-info">
+                <span>${d.os || "不明"}</span>
+                <span>${d.group || "未分類"}</span>
+              </div>
+              ${batteryVal !== null ? `<div class="battery-bar"><div class="battery-fill" style="width:${batteryVal}%;background:${batteryVal < 20 ? 'var(--red)' : 'var(--green)'}"></div></div>` : ''}
+              <div class="card-time" data-ts="${d.lastSeen}">${timeSince(d.lastSeen)}</div>
+            </div>
+          `;
+          card.addEventListener("click", () => openDetail(id));
+          grid.appendChild(card);
+        }
+      });
+
+      // リスト表示のクイックアクション
+      grid.querySelectorAll(".icon-btn").forEach(btn => {
+        btn.addEventListener("click", e => {
+          e.stopPropagation();
+          const { action, id } = btn.dataset;
+          if (action === "lock") quickToggleLock(id);
+          if (action === "ping") pingDevice(id);
+        });
+      });
+    }
+
+    // ===== 詳細パネル =====
+    function openDetail(id) {
+      selectedId = id;
+      document.getElementById("detail-panel").classList.add("open");
+      document.querySelectorAll(".card, .list-row").forEach(el => el.classList.remove("selected"));
+      document.querySelectorAll(`[data-id="${id}"]`).forEach(el => el.closest(".card, .list-row")?.classList.add("selected"));
+      currentTab = "info";
+      renderDetail(id);
+    }
+
+    function renderDetail(id) {
+      const d = allDevices[id];
+      if (!d) return;
+      const alive = isOnline(d.lastSeen);
+      const locked = d.locked;
+
+      document.getElementById("detail-name").textContent = d.label || id;
+      const statusEl = document.getElementById("detail-status");
+      statusEl.textContent = alive ? "● オンライン" : "○ オフライン";
+      statusEl.className = alive ? "status-on" : "status-off";
+      document.getElementById("detail-id").textContent = id;
+
+      // バッテリー
+      const bat = d.battery ?? null;
+      const batEl = document.getElementById("detail-battery");
+      if (bat !== null) {
+        batEl.style.display = "flex";
+        batEl.innerHTML = `<span style="color:${bat < 20 ? 'var(--red)' : 'var(--green)'}">🔋 ${bat}%</span>`;
+      } else {
+        batEl.style.display = "none";
+      }
+
+      // タブコンテンツ
+      renderDetailTab(currentTab, id);
+
+      // ロックボタン
+      const lockBtn = document.getElementById("lock-btn");
+      if (locked) {
+        lockBtn.textContent = "🔓 ロック解除";
+        lockBtn.className = "btn btn-unlock";
+      } else {
+        lockBtn.textContent = "🔒 ロックダウン";
+        lockBtn.className = "btn btn-lock";
+      }
+    }
+
+    function renderDetailTab(tab, id) {
+      const d = allDevices[id];
+      if (!d) return;
+      currentTab = tab;
+
+      document.querySelectorAll(".tab-btn").forEach(b => b.classList.toggle("active", b.dataset.tab === tab));
+
+      const content = document.getElementById("detail-tab-content");
+
+      if (tab === "info") {
+        content.innerHTML = `
+          <div class="info-grid">
+            <div class="info-row"><span class="info-label">OS</span><span>${d.os || "不明"}</span></div>
+            <div class="info-row"><span class="info-label">ブラウザ</span><span>${d.browser || "不明"}</span></div>
+            <div class="info-row"><span class="info-label">画面解像度</span><span>${d.screen || "不明"}</span></div>
+            <div class="info-row"><span class="info-label">言語</span><span>${d.lang || "不明"}</span></div>
+            <div class="info-row"><span class="info-label">IPアドレス</span><span class="mono">${d.ip || "不明"}</span></div>
+            <div class="info-row"><span class="info-label">グループ</span><span>${d.group || "未分類"}</span></div>
+            <div class="info-row"><span class="info-label">最終確認</span><span data-ts="${d.lastSeen}">${timeSince(d.lastSeen)}</span></div>
+            ${d.battery != null ? `<div class="info-row"><span class="info-label">バッテリー</span><span>${d.battery}%</span></div>` : ""}
+            ${d.note ? `<div class="info-row"><span class="info-label">メモ</span><span>${d.note}</span></div>` : ""}
+          </div>
+          <div class="detail-section-gap"></div>
+          <div class="section-title">ラベル変更</div>
+          <div class="input-row">
+            <input type="text" id="rename-input" value="${d.label || id}" placeholder="表示名">
+            <button class="btn btn-sm" id="rename-btn">変更</button>
+          </div>
+          <div class="detail-section-gap"></div>
+          <div class="section-title">グループ</div>
+          <div class="input-row">
+            <input type="text" id="group-input" value="${d.group || ""}" placeholder="例: クラスA" list="group-list">
+            <datalist id="group-list">${getGroupOptions()}</datalist>
+            <button class="btn btn-sm" id="group-save-btn">保存</button>
+          </div>
+          <div class="detail-section-gap"></div>
+          <div class="section-title">メモ</div>
+          <div class="input-row">
+            <input type="text" id="note-input" value="${d.note || ""}" placeholder="メモを入力">
+            <button class="btn btn-sm" id="note-save-btn">保存</button>
+          </div>
+        `;
+        document.getElementById("rename-btn").addEventListener("click", () => {
+          const v = document.getElementById("rename-input").value.trim();
+          if (v) { update(ref(db, `devices/${id}`), { label: v }); showToast("ラベルを変更しました"); addLog("edit", id, v, "ラベルを変更しました"); }
+        });
+        document.getElementById("group-save-btn").addEventListener("click", () => {
+          const g = document.getElementById("group-input").value.trim();
+          update(ref(db, `devices/${id}`), { group: g || "" });
+          if (g) set(ref(db, `groups/${g}`), true);
+          showToast("グループを更新しました");
+        });
+        document.getElementById("note-save-btn").addEventListener("click", () => {
+          const v = document.getElementById("note-input").value.trim();
+          update(ref(db, `devices/${id}`), { note: v });
+          showToast("メモを保存しました");
+        });
+      }
+
+      if (tab === "history") {
+        const hist = d.urlHistory ? Object.values(d.urlHistory).sort((a, b) => b.ts - a.ts).slice(0, 50) : [];
+        content.innerHTML = `
+          <div class="section-title">URL履歴 <span class="count-badge">${hist.length}</span></div>
+          ${hist.length === 0
+            ? '<div class="empty-small">履歴なし</div>'
+            : hist.map(h => `
+              <div class="hist-row">
+                <span class="hist-time">${timeSince(h.ts)}</span>
+                <a class="hist-url" href="${h.url}" target="_blank" rel="noopener" title="${h.url}">${h.url}</a>
+              </div>`).join("")}
+          ${hist.length > 0 ? `<button class="btn btn-sm btn-danger-soft" id="clear-hist-btn" style="margin-top:10px;width:100%">履歴を消去</button>` : ""}
+        `;
+        document.getElementById("clear-hist-btn")?.addEventListener("click", () => {
+          if (!confirm("URL履歴を削除しますか？")) return;
+          update(ref(db, `devices/${id}`), { urlHistory: null });
+          showToast("履歴を削除しました");
+          addLog("edit", id, d.label || id, "URL履歴を削除しました");
+        });
+      }
+
+      if (tab === "actions") {
+        content.innerHTML = `
+          <div class="section-title">メッセージ送信</div>
+          <textarea id="msg-input" rows="2" placeholder="PCに表示するメッセージ">${d.pendingMessage || ""}</textarea>
+          <div class="btn-row">
+            <button class="btn btn-primary btn-sm" id="msg-send-btn">送信</button>
+            <button class="btn btn-sm" id="msg-clear-btn">クリア</button>
+          </div>
+          <div class="detail-section-gap"></div>
+          <div class="section-title">クイックメッセージ</div>
+          <div class="quick-msgs">
+            ${["授業を始めます。画面に集中してください。","作業を終了してください。","この時間は端末を閉じてください。","自由時間です。"].map(m =>
+              `<button class="quick-msg-btn" data-msg="${m}">${m}</button>`
+            ).join("")}
+          </div>
+          <div class="detail-section-gap"></div>
+          <div class="section-title">URLを開かせる</div>
+          <div class="input-row">
+            <input type="url" id="open-url-input" placeholder="https://example.com">
+            <button class="btn btn-sm btn-primary" id="open-url-btn">送信</button>
+          </div>
+          <div class="detail-section-gap"></div>
+          <div class="section-title">Ping</div>
+          <button class="btn btn-sm" id="ping-btn" style="width:100%">📡 Pingを送る</button>
+          <div id="ping-result" class="ping-result"></div>
+        `;
+
+        document.getElementById("msg-send-btn").addEventListener("click", () => {
+          const msg = document.getElementById("msg-input").value.trim();
+          if (!msg) return;
+          update(ref(db, `devices/${id}`), { pendingMessage: msg, messageTs: Date.now() });
+          showToast("メッセージを送信しました");
+          addLog("msg", id, d.label || id, `メッセージ: ${msg}`);
+        });
+        document.getElementById("msg-clear-btn").addEventListener("click", () => {
+          update(ref(db, `devices/${id}`), { pendingMessage: null, messageTs: null });
+          document.getElementById("msg-input").value = "";
+          showToast("メッセージをクリアしました");
+        });
+        document.querySelectorAll(".quick-msg-btn").forEach(btn => {
+          btn.addEventListener("click", () => {
+            document.getElementById("msg-input").value = btn.dataset.msg;
+          });
+        });
+        document.getElementById("open-url-btn").addEventListener("click", () => {
+          const url = document.getElementById("open-url-input").value.trim();
+          if (!url) return;
+          update(ref(db, `devices/${id}`), { openUrl: url, openUrlTs: Date.now() });
+          showToast("URLを送信しました");
+          addLog("msg", id, d.label || id, `URLを送信: ${url}`);
+        });
+        document.getElementById("ping-btn").addEventListener("click", () => {
+          pingDevice(id);
+        });
+      }
+    }
+
+    function getGroupOptions() {
+      const groups = new Set(Object.values(allDevices).map(d => d.group).filter(Boolean));
+      return [...groups].map(g => `<option value="${g}">`).join("");
+    }
+
+    // ===== タブ切り替え =====
+    document.querySelectorAll(".tab-btn").forEach(btn => {
+      btn.addEventListener("click", () => {
+        if (selectedId) renderDetailTab(btn.dataset.tab, selectedId);
+      });
+    });
+
+    // ===== ロック =====
+    document.getElementById("lock-btn").addEventListener("click", () => {
+      if (!selectedId) return;
+      const d = allDevices[selectedId];
+      if (d.locked) {
+        update(ref(db, `devices/${selectedId}`), { locked: false, lockMessage: "" });
+        showToast("ロックを解除しました", "success");
+        addLog("unlock", selectedId, d.label || selectedId, "ロックを解除しました");
+      } else {
+        document.getElementById("lock-modal").style.display = "flex";
+        document.getElementById("lock-modal").dataset.target = "single";
+      }
+    });
+
+    document.getElementById("lock-send-btn").addEventListener("click", () => {
+      const msg = document.getElementById("lock-message-input").value.trim() || "このパソコンは管理者によってロックされています。";
+      const target = document.getElementById("lock-modal").dataset.target;
+
+      if (target === "single" && selectedId) {
+        update(ref(db, `devices/${selectedId}`), { locked: true, lockMessage: msg });
+        const d = allDevices[selectedId];
+        addLog("lock", selectedId, d?.label || selectedId, `ロックしました`);
+        showToast("ロックしました", "warn");
+      } else if (target === "all") {
+        Object.entries(allDevices).forEach(([id, d]) => {
+          if (currentFilter === "all" || d.group === currentFilter) {
+            update(ref(db, `devices/${id}`), { locked: true, lockMessage: msg });
+            addLog("lock", id, d.label || id, "一斉ロック");
+          }
+        });
+        showToast("一斉ロックを実行しました", "warn");
+      }
+
+      document.getElementById("lock-modal").style.display = "none";
+      document.getElementById("lock-message-input").value = "";
+    });
+
+    document.getElementById("lock-cancel-btn").addEventListener("click", () => {
+      document.getElementById("lock-modal").style.display = "none";
+    });
+
+    function quickToggleLock(id) {
+      const d = allDevices[id];
+      if (!d) return;
+      if (d.locked) {
+        update(ref(db, `devices/${id}`), { locked: false, lockMessage: "" });
+        showToast(`${d.label || id} のロックを解除`, "success");
+        addLog("unlock", id, d.label || id, "ロックを解除しました");
+      } else {
+        update(ref(db, `devices/${id}`), { locked: true, lockMessage: "このパソコンは管理者によってロックされています。" });
+        showToast(`${d.label || id} をロック`, "warn");
+        addLog("lock", id, d.label || id, "ロックしました");
+      }
+    }
+
+    // ===== 一斉ロック / 解除 =====
+    document.getElementById("lockall-btn").addEventListener("click", () => {
+      if (!confirm("表示中の全PCをロックしますか？")) return;
+      document.getElementById("lock-modal").style.display = "flex";
+      document.getElementById("lock-modal").dataset.target = "all";
+    });
+
+    document.getElementById("unlockall-btn").addEventListener("click", () => {
+      if (!confirm("表示中の全PCのロックを解除しますか？")) return;
+      Object.entries(allDevices).forEach(([id, d]) => {
+        if (currentFilter === "all" || d.group === currentFilter) {
+          update(ref(db, `devices/${id}`), { locked: false, lockMessage: "" });
+        }
+      });
+      showToast("一斉ロック解除しました", "success");
+    });
+
+    // ===== 一斉メッセージ =====
+    document.getElementById("broadcast-btn").addEventListener("click", () => {
+      document.getElementById("broadcast-modal").style.display = "flex";
+    });
+
+    document.getElementById("broadcast-send-btn").addEventListener("click", () => {
+      const msg = document.getElementById("broadcast-input").value.trim();
+      if (!msg) return;
+      let count = 0;
+      Object.entries(allDevices).forEach(([id, d]) => {
+        if (currentFilter === "all" || d.group === currentFilter) {
+          if (isOnline(d.lastSeen)) {
+            update(ref(db, `devices/${id}`), { pendingMessage: msg, messageTs: Date.now() });
+            count++;
+          }
+        }
+      });
+      showToast(`${count}台にメッセージを送信しました`);
+      addLog("msg", "all", "全体", `一斉メッセージ: ${msg}`);
+      document.getElementById("broadcast-modal").style.display = "none";
+      document.getElementById("broadcast-input").value = "";
+    });
+
+    document.getElementById("broadcast-cancel-btn").addEventListener("click", () => {
+      document.getElementById("broadcast-modal").style.display = "none";
+    });
+
+    // ===== Ping =====
+    function pingDevice(id) {
+      const d = allDevices[id];
+      if (!d) return;
+      const ts = Date.now();
+      update(ref(db, `devices/${id}`), { pingRequest: ts });
+      addLog("ping", id, d.label || id, "Pingを送信");
+      showToast(`📡 Ping送信: ${d.label || id}`);
+
+      const resEl = document.getElementById("ping-result");
+      if (resEl) {
+        resEl.textContent = "⌛ 応答待ち...";
+        resEl.className = "ping-result ping-waiting";
+      }
+
+      onValue(ref(db, `devices/${id}/pingResponse`), snap => {
+        const res = snap.val();
+        if (res && res > ts) {
+          const rtt = res - ts;
+          if (resEl) {
+            resEl.textContent = `✅ ${rtt}ms`;
+            resEl.className = "ping-result ping-ok";
+          }
+          showToast(`✅ Ping応答: ${d.label || id} ${rtt}ms`, "success");
+        }
+      }, { onlyOnce: true });
+    }
+
+    // ===== 削除 =====
+    document.getElementById("delete-btn").addEventListener("click", () => {
+      if (!selectedId) return;
+      const d = allDevices[selectedId];
+      if (!confirm(`「${d?.label || selectedId}」を削除しますか？`)) return;
+      remove(ref(db, `devices/${selectedId}`));
+      addLog("edit", selectedId, d?.label || selectedId, "デバイスを削除しました");
+      closeDetail();
+    });
+
+    // ===== パネルを閉じる =====
+    function closeDetail() {
+      document.getElementById("detail-panel").classList.remove("open");
+      selectedId = null;
+    }
+
+    document.getElementById("detail-close").addEventListener("click", closeDetail);
+
+    // ===== 検索 =====
+    document.getElementById("search").addEventListener("input", e => {
+      searchQuery = e.target.value.toLowerCase();
+      renderDevices();
+    });
+
+    // ===== ビュー切替 =====
+    document.getElementById("view-grid").addEventListener("click", () => {
+      viewMode = "grid";
+      document.getElementById("view-grid").classList.add("active");
+      document.getElementById("view-list").classList.remove("active");
+      renderDevices();
+    });
+    document.getElementById("view-list").addEventListener("click", () => {
+      viewMode = "list";
+      document.getElementById("view-list").classList.add("active");
+      document.getElementById("view-grid").classList.remove("active");
+      renderDevices();
+    });
+
+    // ===== スケジュールタスク =====
+    function loadScheduledTasks() {
+      const saved = localStorage.getItem("scheduled_tasks");
+      if (saved) scheduledTasks = JSON.parse(saved);
+      renderScheduledTasks();
+    }
+
+    function saveScheduledTasks() {
+      localStorage.setItem("scheduled_tasks", JSON.stringify(scheduledTasks));
+    }
+
+    function checkScheduledTasks() {
+      const now = new Date();
+      const hhmm = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
+      const day = now.getDay();
+
+      scheduledTasks.forEach(task => {
+        if (!task.enabled) return;
+        if (task.time !== hhmm) return;
+        if (task.days && !task.days.includes(day)) return;
+
+        const lastRun = task.lastRun;
+        const thisMinute = Math.floor(Date.now() / 60000);
+        if (lastRun === thisMinute) return;
+        task.lastRun = thisMinute;
+        saveScheduledTasks();
+
+        const targetDevices = Object.entries(allDevices).filter(([id, d]) =>
+          task.group === "all" || d.group === task.group
+        );
+
+        if (task.action === "lock") {
+          targetDevices.forEach(([id, d]) => update(ref(db, `devices/${id}`), { locked: true, lockMessage: task.message || "管理者によってロックされました。" }));
+          showToast(`⏰ スケジュール: ${task.name} 実行`, "warn");
+        } else if (task.action === "unlock") {
+          targetDevices.forEach(([id]) => update(ref(db, `devices/${id}`), { locked: false, lockMessage: "" }));
+          showToast(`⏰ スケジュール: ${task.name} 実行`);
+        } else if (task.action === "message") {
+          targetDevices.forEach(([id]) => update(ref(db, `devices/${id}`), { pendingMessage: task.message, messageTs: Date.now() }));
+          showToast(`⏰ スケジュール: ${task.name} 実行`);
+        }
+        addLog("schedule", "auto", task.name, `スケジュール実行: ${task.action}`);
+      });
+    }
+
+    function renderScheduledTasks() {
+      const el = document.getElementById("task-list");
+      if (!scheduledTasks.length) {
+        el.innerHTML = `<div class="empty-small">スケジュールなし</div>`;
+        return;
+      }
+      const days = ["日", "月", "火", "水", "木", "金", "土"];
+      el.innerHTML = scheduledTasks.map((t, i) => `
+        <div class="task-row ${t.enabled ? "" : "task-disabled"}">
+          <label class="toggle"><input type="checkbox" ${t.enabled ? "checked" : ""} data-task-idx="${i}"><span class="toggle-slider"></span></label>
+          <div class="task-info">
+            <span class="task-name">${t.name}</span>
+            <span class="task-meta">${t.time} ${t.days ? t.days.map(d => days[d]).join("") : "毎日"} · ${t.action === "lock" ? "🔒" : t.action === "unlock" ? "🔓" : "💬"} ${t.group === "all" ? "全体" : t.group}</span>
+          </div>
+          <button class="icon-btn" data-del-task="${i}" title="削除">🗑</button>
+        </div>
+      `).join("");
+
+      el.querySelectorAll("[data-task-idx]").forEach(cb => {
+        cb.addEventListener("change", () => {
+          scheduledTasks[cb.dataset.taskIdx].enabled = cb.checked;
+          saveScheduledTasks();
+          renderScheduledTasks();
+        });
+      });
+      el.querySelectorAll("[data-del-task]").forEach(btn => {
+        btn.addEventListener("click", () => {
+          scheduledTasks.splice(parseInt(btn.dataset.delTask), 1);
+          saveScheduledTasks();
+          renderScheduledTasks();
+        });
+      });
+    }
+
+    document.getElementById("schedule-toggle").addEventListener("click", () => {
+      document.getElementById("schedule-panel").classList.toggle("open");
+    });
+
+    document.getElementById("add-task-btn").addEventListener("click", () => {
+      document.getElementById("task-modal").style.display = "flex";
+      const groups = new Set(Object.values(allDevices).map(d => d.group).filter(Boolean));
+      const sel = document.getElementById("task-group-sel");
+      sel.innerHTML = `<option value="all">すべて</option>` + [...groups].map(g => `<option value="${g}">${g}</option>`).join("");
+    });
+
+    document.getElementById("task-save-btn").addEventListener("click", () => {
+      const name = document.getElementById("task-name-input").value.trim() || "タスク";
+      const time = document.getElementById("task-time-input").value;
+      const action = document.getElementById("task-action-sel").value;
+      const group = document.getElementById("task-group-sel").value;
+      const message = document.getElementById("task-msg-input").value.trim();
+      const dayChecks = [...document.querySelectorAll(".day-check:checked")].map(c => parseInt(c.value));
+
+      if (!time) { showToast("時刻を設定してください"); return; }
+
+      scheduledTasks.push({ name, time, action, group, message, days: dayChecks.length ? dayChecks : null, enabled: true });
+      saveScheduledTasks();
+      renderScheduledTasks();
+      document.getElementById("task-modal").style.display = "none";
+      showToast("スケジュールを追加しました", "success");
+    });
+
+    document.getElementById("task-cancel-btn").addEventListener("click", () => {
+      document.getElementById("task-modal").style.display = "none";
+    });
+
+    // ===== エクスポート =====
+    document.getElementById("export-btn").addEventListener("click", () => {
+      const rows = [["ID", "ラベル", "OS", "ブラウザ", "IP", "グループ", "ステータス", "最終確認"]];
+      Object.entries(allDevices).forEach(([id, d]) => {
+        rows.push([id, d.label || "", d.os || "", d.browser || "", d.ip || "", d.group || "", isOnline(d.lastSeen) ? "オンライン" : "オフライン", new Date(d.lastSeen).toLocaleString("ja-JP")]);
+      });
+      const csv = rows.map(r => r.map(v => `"${String(v).replace(/"/g, '""')}"`).join(",")).join("\n");
+      const blob = new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = `devices_${new Date().toISOString().slice(0, 10)}.csv`;
+      a.click();
+      showToast("CSVをエクスポートしました", "success");
+    });
+
+    // ===== キーボードショートカット =====
+    document.addEventListener("keydown", e => {
+      if (e.key === "Escape") closeDetail();
+      if (e.key === "/" && !e.target.matches("input, textarea")) {
+        e.preventDefault();
+        document.getElementById("search").focus();
+      }
+    });
+  </script>
+
+  <style>
+    :root {
+      --bg: #0b0d14;
+      --surface: #13161f;
+      --surface2: #1c2030;
+      --border: #252836;
+      --accent: #5b8dee;
+      --green: #2dd4a0;
+      --red: #f1596b;
+      --amber: #f59e0b;
+      --text: #dde3f0;
+      --muted: #5a6380;
+      --radius: 10px;
+      --font: 'Inter', system-ui, sans-serif;
+      --mono: 'JetBrains Mono', monospace;
+    }
+    @media (prefers-color-scheme: light) {
+      :root { --bg: #f0f2f9; --surface: #fff; --surface2: #f7f8fc; --border: #dde3f0; --text: #111827; --muted: #6b7280; }
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: var(--bg); color: var(--text); font-family: var(--font); height: 100vh; overflow: hidden; font-size: 13px; }
+
+    /* ===== ログイン ===== */
+    #login-screen {
+      position: fixed; inset: 0; background: var(--bg);
+      display: flex; align-items: center; justify-content: center; z-index: 100;
+    }
+    .login-card {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 18px; padding: 44px 36px; width: 340px; text-align: center;
+    }
+    .login-logo { font-size: 36px; margin-bottom: 16px; }
+    .login-card h1 { font-size: 18px; font-weight: 700; margin-bottom: 6px; }
+    .login-card p { color: var(--muted); font-size: 12px; margin-bottom: 28px; }
+    .login-card input {
+      width: 100%; background: var(--bg); border: 1px solid var(--border);
+      color: var(--text); padding: 11px 14px; border-radius: var(--radius); font-size: 14px;
+      margin-bottom: 12px; outline: none; font-family: var(--font);
+    }
+    .login-card input:focus { border-color: var(--accent); }
+    .login-card input.shake { animation: shake .4s; }
+    @keyframes shake { 0%,100%{transform:translateX(0)} 25%{transform:translateX(-6px)} 75%{transform:translateX(6px)} }
+    #login-error { color: var(--red); font-size: 12px; margin-top: 6px; min-height: 16px; }
+
+    /* ===== メイン ===== */
+    #main-screen { display: none; height: 100vh; flex-direction: column; }
+
+    /* ===== ヘッダー ===== */
+    header {
+      background: var(--surface); border-bottom: 1px solid var(--border);
+      padding: 10px 16px; display: flex; align-items: center; gap: 10px; flex-shrink: 0;
+      flex-wrap: wrap;
+    }
+    .logo { font-size: 14px; font-weight: 700; color: var(--accent); letter-spacing: -.3px; white-space: nowrap; }
+    .logo span { opacity: .5; font-weight: 400; font-size: 11px; margin-left: 4px; }
+    .header-search {
+      background: var(--bg); border: 1px solid var(--border); color: var(--text);
+      padding: 7px 12px; border-radius: var(--radius); font-size: 12px; width: 200px; outline: none;
+      font-family: var(--font);
+    }
+    .header-search:focus { border-color: var(--accent); }
+    .header-actions { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+    .stats-row { display: flex; gap: 10px; margin-left: auto; }
+    .stat-chip { display: flex; align-items: center; gap: 5px; font-size: 11px; color: var(--muted); background: var(--surface2); border: 1px solid var(--border); border-radius: 20px; padding: 4px 10px; }
+    .stat-chip strong { color: var(--text); }
+    .stat-chip.stat-online strong { color: var(--green); }
+    .stat-chip.stat-locked strong { color: var(--red); }
+
+    /* ===== ボタン ===== */
+    .btn { padding: 7px 13px; border-radius: var(--radius); border: none; font-size: 12px; font-weight: 600; cursor: pointer; font-family: var(--font); transition: opacity .15s; white-space: nowrap; }
+    .btn:active { opacity: .75; }
+    .btn-primary { background: var(--accent); color: #fff; }
+    .btn-danger { background: rgba(241,89,107,.15); color: var(--red); }
+    .btn-warn { background: rgba(245,158,11,.15); color: var(--amber); }
+    .btn-success { background: rgba(45,212,160,.15); color: var(--green); }
+    .btn-ghost { background: var(--surface2); color: var(--text); border: 1px solid var(--border); }
+    .btn-lock { background: rgba(241,89,107,.12); color: var(--red); width: 100%; padding: 10px; }
+    .btn-unlock { background: rgba(45,212,160,.12); color: var(--green); width: 100%; padding: 10px; }
+    .btn-sm { padding: 6px 11px; font-size: 11px; }
+    .btn-danger-soft { background: rgba(241,89,107,.1); color: var(--red); }
+    .icon-btn { background: none; border: none; font-size: 14px; cursor: pointer; padding: 4px 6px; border-radius: 6px; opacity: .7; transition: opacity .15s, background .15s; }
+    .icon-btn:hover { opacity: 1; background: var(--surface2); }
+    .view-btn { background: var(--surface2); border: 1px solid var(--border); color: var(--muted); padding: 5px 9px; border-radius: 6px; font-size: 14px; cursor: pointer; }
+    .view-btn.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+    /* ===== グループフィルター ===== */
+    #group-filter {
+      padding: 7px 16px; background: var(--surface); border-bottom: 1px solid var(--border);
+      display: flex; gap: 6px; overflow-x: auto; flex-shrink: 0; scrollbar-width: none;
+    }
+    #group-filter::-webkit-scrollbar { display: none; }
+    .filter-btn {
+      background: none; border: 1px solid var(--border); color: var(--muted);
+      padding: 3px 12px; border-radius: 20px; font-size: 11px; cursor: pointer; white-space: nowrap;
+      font-family: var(--font); font-weight: 500; display: flex; align-items: center; gap: 5px;
+    }
+    .filter-btn.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+    .filter-count { background: rgba(255,255,255,.2); border-radius: 10px; padding: 0 5px; font-size: 10px; }
+
+    /* ===== コンテンツ ===== */
+    .content { display: flex; flex: 1; overflow: hidden; }
+
+    /* ===== グリッド ===== */
+    .device-grid {
+      flex: 1; overflow-y: auto; padding: 16px;
+      display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 10px; align-content: start;
+    }
+    .card {
+      background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+      overflow: hidden; cursor: pointer; transition: transform .1s, border-color .1s;
+    }
+    .card:hover, .card.selected { border-color: var(--accent); }
+    .card.selected { box-shadow: 0 0 0 2px rgba(91,141,238,.2); }
+    .card.online .card-status-bar { height: 2px; background: var(--green); }
+    .card.offline .card-status-bar { height: 2px; background: var(--border); }
+    .card.locked { border-color: rgba(241,89,107,.5); }
+    .card-body { padding: 11px; }
+    .card-top { display: flex; align-items: center; gap: 7px; margin-bottom: 5px; }
+    .dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+    .dot-on { background: var(--green); box-shadow: 0 0 5px var(--green); }
+    .dot-off { background: var(--muted); }
+    .card-name { font-weight: 600; font-size: 12px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .card-badges { display: flex; gap: 3px; }
+    .card-info { font-size: 10px; color: var(--muted); display: flex; gap: 6px; margin-bottom: 4px; }
+    .card-time { font-size: 10px; color: var(--muted); }
+    .battery-bar { height: 2px; background: var(--border); border-radius: 1px; margin: 5px 0 2px; }
+    .battery-fill { height: 100%; border-radius: 1px; }
+
+    /* ===== リスト表示 ===== */
+    .device-list {
+      flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 4px;
+    }
+    .list-row {
+      background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+      display: grid; grid-template-columns: 20px 1fr 120px 110px 100px 1fr 80px 70px;
+      align-items: center; padding: 8px 12px; gap: 10px; cursor: pointer;
+      transition: border-color .1s;
+    }
+    .list-row:hover, .list-row.selected { border-color: var(--accent); }
+    .list-row.locked { border-color: rgba(241,89,107,.4); }
+    .list-name { font-weight: 600; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .list-meta { font-size: 11px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .list-badges { display: flex; gap: 3px; }
+    .list-time { font-size: 10px; color: var(--muted); text-align: right; }
+    .list-actions { display: flex; gap: 2px; justify-content: flex-end; }
+
+    /* ===== バッジ ===== */
+    .badge { display: inline-block; font-size: 10px; padding: 1px 6px; border-radius: 10px; font-weight: 500; }
+    .badge-red { background: rgba(241,89,107,.15); color: var(--red); }
+    .badge-blue { background: rgba(91,141,238,.15); color: var(--accent); }
+    .badge-muted { background: var(--surface2); color: var(--muted); }
+
+    /* ===== 空状態 ===== */
+    .empty-state { grid-column: 1/-1; text-align: center; color: var(--muted); padding: 60px 20px; font-size: 14px; }
+    .empty-icon { font-size: 36px; margin-bottom: 10px; opacity: .4; }
+    .empty-small { color: var(--muted); font-size: 11px; padding: 10px 0; }
+
+    /* ===== 詳細パネル ===== */
+    #detail-panel {
+      display: none; width: 320px; flex-shrink: 0; background: var(--surface);
+      border-left: 1px solid var(--border); flex-direction: column; overflow: hidden;
+    }
+    #detail-panel.open { display: flex; }
+    .detail-header {
+      padding: 14px 16px; border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+    .detail-header-top { display: flex; align-items: flex-start; gap: 8px; }
+    .detail-header h2 { font-size: 14px; font-weight: 700; flex: 1; }
+    .detail-close { background: none; border: none; color: var(--muted); font-size: 18px; cursor: pointer; line-height: 1; padding: 2px; }
+    .status-on { color: var(--green); font-size: 11px; }
+    .status-off { color: var(--muted); font-size: 11px; }
+    #detail-id { font-size: 10px; color: var(--muted); font-family: var(--mono); }
+    .detail-meta-row { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
+    #detail-battery { font-size: 11px; }
+
+    /* ===== タブ ===== */
+    .detail-tabs { display: flex; border-bottom: 1px solid var(--border); flex-shrink: 0; }
+    .tab-btn {
+      flex: 1; padding: 8px 4px; background: none; border: none; color: var(--muted);
+      font-size: 11px; cursor: pointer; font-family: var(--font); font-weight: 500;
+      border-bottom: 2px solid transparent; transition: color .15s;
+    }
+    .tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
+    .tab-btn:hover { color: var(--text); }
+
+    .detail-scroll { flex: 1; overflow-y: auto; padding: 14px 16px; }
+    .section-title { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; margin-bottom: 8px; font-weight: 600; }
+    .detail-section-gap { height: 14px; }
+    .info-grid {}
+    .info-row { display: flex; justify-content: space-between; font-size: 11px; gap: 8px; padding: 4px 0; border-bottom: 1px solid var(--border); }
+    .info-row:last-child { border-bottom: none; }
+    .info-label { color: var(--muted); flex-shrink: 0; }
+    .info-row span:last-child { text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 160px; }
+    .mono { font-family: var(--mono); font-size: 11px; }
+
+    .input-row { display: flex; gap: 6px; }
+    .input-row input, .detail-scroll textarea {
+      flex: 1; background: var(--bg); border: 1px solid var(--border); color: var(--text);
+      padding: 7px 10px; border-radius: 7px; font-size: 12px; outline: none; font-family: var(--font);
+    }
+    .detail-scroll textarea { width: 100%; resize: none; margin-bottom: 8px; }
+    .input-row input:focus, .detail-scroll textarea:focus { border-color: var(--accent); }
+    .btn-row { display: flex; gap: 6px; }
+
+    /* 履歴 */
+    .hist-row { display: flex; gap: 8px; font-size: 11px; padding: 4px 0; border-bottom: 1px solid var(--border); align-items: flex-start; }
+    .hist-time { color: var(--muted); flex-shrink: 0; min-width: 55px; }
+    .hist-url { color: var(--accent); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-decoration: none; flex: 1; }
+    .hist-url:hover { text-decoration: underline; }
+
+    /* クイックメッセージ */
+    .quick-msgs { display: flex; flex-direction: column; gap: 4px; margin-bottom: 8px; }
+    .quick-msg-btn {
+      background: var(--surface2); border: 1px solid var(--border); color: var(--text);
+      padding: 6px 10px; border-radius: 6px; font-size: 11px; text-align: left; cursor: pointer;
+      font-family: var(--font); transition: border-color .1s;
+    }
+    .quick-msg-btn:hover { border-color: var(--accent); }
+
+    /* Ping結果 */
+    .ping-result { font-size: 12px; padding: 8px 0; font-weight: 600; }
+    .ping-waiting { color: var(--muted); }
+    .ping-ok { color: var(--green); }
+
+    /* アクションボタン */
+    .detail-footer { padding: 12px 16px; border-top: 1px solid var(--border); display: flex; flex-direction: column; gap: 8px; flex-shrink: 0; }
+
+    /* ===== カウントバッジ ===== */
+    .count-badge { background: var(--surface2); border: 1px solid var(--border); color: var(--muted); border-radius: 10px; padding: 1px 7px; font-size: 10px; font-weight: 500; margin-left: 4px; }
+
+    /* ===== ログパネル ===== */
+    #log-panel {
+      position: fixed; bottom: 0; left: 0; right: 0; height: 0;
+      background: var(--surface); border-top: 1px solid var(--border);
+      transition: height .2s; overflow: hidden; z-index: 50;
+    }
+    #log-panel.open { height: 220px; }
+    .log-header { display: flex; align-items: center; padding: 8px 16px; border-bottom: 1px solid var(--border); gap: 10px; }
+    .log-header h3 { font-size: 12px; font-weight: 600; flex: 1; }
+    #log-list { overflow-y: auto; height: 170px; padding: 6px 0; }
+    .log-row { display: flex; align-items: center; gap: 8px; padding: 4px 16px; font-size: 11px; }
+    .log-row:hover { background: var(--surface2); }
+    .log-icon { font-size: 12px; flex-shrink: 0; }
+    .log-content { flex: 1; display: flex; gap: 8px; overflow: hidden; }
+    .log-label { font-weight: 600; white-space: nowrap; }
+    .log-msg { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .log-time { color: var(--muted); flex-shrink: 0; }
+    .log-empty { text-align: center; color: var(--muted); padding: 20px; font-size: 12px; }
+
+    /* ===== スケジュールパネル ===== */
+    #schedule-panel {
+      position: fixed; top: 0; right: 0; bottom: 0; width: 300px;
+      background: var(--surface); border-left: 1px solid var(--border);
+      transform: translateX(100%); transition: transform .2s; z-index: 60; display: flex; flex-direction: column;
+    }
+    #schedule-panel.open { transform: translateX(0); }
+    .panel-header { display: flex; align-items: center; padding: 14px 16px; border-bottom: 1px solid var(--border); gap: 10px; flex-shrink: 0; }
+    .panel-header h3 { font-size: 13px; font-weight: 700; flex: 1; }
+    #task-list { flex: 1; overflow-y: auto; padding: 10px 12px; display: flex; flex-direction: column; gap: 6px; }
+    .task-row { display: flex; align-items: center; gap: 8px; background: var(--surface2); border: 1px solid var(--border); border-radius: 8px; padding: 10px; }
+    .task-row.task-disabled { opacity: .5; }
+    .task-info { flex: 1; overflow: hidden; }
+    .task-name { display: block; font-size: 12px; font-weight: 600; }
+    .task-meta { display: block; font-size: 10px; color: var(--muted); margin-top: 2px; }
+
+    /* トグル */
+    .toggle { position: relative; display: inline-block; width: 28px; height: 16px; flex-shrink: 0; }
+    .toggle input { opacity: 0; width: 0; height: 0; }
+    .toggle-slider { position: absolute; inset: 0; background: var(--border); border-radius: 8px; cursor: pointer; transition: background .2s; }
+    .toggle-slider:before { content: ""; position: absolute; height: 12px; width: 12px; left: 2px; top: 2px; background: #fff; border-radius: 50%; transition: transform .2s; }
+    .toggle input:checked + .toggle-slider { background: var(--accent); }
+    .toggle input:checked + .toggle-slider:before { transform: translateX(12px); }
+
+    /* ===== モーダル ===== */
+    .modal-overlay {
+      display: none; position: fixed; inset: 0; background: rgba(0,0,0,.7);
+      align-items: center; justify-content: center; z-index: 200;
+    }
+    .modal-card {
+      background: var(--surface); border: 1px solid var(--border); border-radius: 16px;
+      padding: 28px; width: 420px; max-width: calc(100vw - 32px);
+    }
+    .modal-card h3 { font-size: 15px; font-weight: 700; margin-bottom: 6px; }
+    .modal-card p { color: var(--muted); font-size: 12px; margin-bottom: 16px; }
+    .modal-card textarea, .modal-card input[type="text"], .modal-card input[type="url"], .modal-card input[type="time"], .modal-card select {
+      width: 100%; background: var(--bg); border: 1px solid var(--border); color: var(--text);
+      padding: 10px 12px; border-radius: 8px; font-size: 13px; outline: none; font-family: var(--font);
+      margin-bottom: 12px;
+    }
+    .modal-card textarea { resize: vertical; min-height: 80px; }
+    .modal-card textarea:focus, .modal-card input:focus, .modal-card select:focus { border-color: var(--accent); }
+    .modal-label { font-size: 11px; color: var(--muted); margin-bottom: 5px; display: block; font-weight: 500; }
+    .modal-btns { display: flex; gap: 10px; margin-top: 4px; }
+    .modal-btns button { flex: 1; padding: 10px; border-radius: 8px; border: none; font-size: 13px; font-weight: 600; cursor: pointer; font-family: var(--font); }
+    .day-checks { display: flex; gap: 6px; margin-bottom: 14px; }
+    .day-check-label { display: flex; flex-direction: column; align-items: center; gap: 3px; font-size: 10px; color: var(--muted); }
+    .day-check-label input { width: 14px; height: 14px; }
+
+    /* ===== トースト ===== */
+    #toast-area { position: fixed; bottom: 24px; right: 24px; display: flex; flex-direction: column; gap: 6px; z-index: 400; pointer-events: none; }
+    .toast {
+      background: var(--surface2); border: 1px solid var(--border); color: var(--text);
+      padding: 10px 14px; border-radius: 10px; font-size: 12px; font-weight: 500;
+      display: flex; align-items: center; gap: 10px; pointer-events: auto;
+      animation: toastin .2s ease; min-width: 220px;
+    }
+    .toast span { flex: 1; }
+    .toast button { background: none; border: none; color: var(--muted); cursor: pointer; font-size: 14px; }
+    .toast-success { border-color: rgba(45,212,160,.4); }
+    .toast-warn { border-color: rgba(241,89,107,.4); }
+    .toast-out { animation: toastout .3s ease forwards; }
+    @keyframes toastin { from { opacity:0; transform:translateY(8px); } to { opacity:1; transform:translateY(0); } }
+    @keyframes toastout { to { opacity:0; transform:translateY(8px); } }
+
+    @media (max-width: 600px) {
+      .list-row { grid-template-columns: 20px 1fr 1fr 60px; }
+      .list-row .list-meta:nth-child(3), .list-row .list-meta:nth-child(4), .list-row .list-badges { display: none; }
+      #detail-panel.open { width: 100%; position: fixed; inset: 0; z-index: 50; }
+      .stats-row { display: none; }
+    }
+  </style>
+</head>
+<body>
+
+<!-- ログイン画面 -->
+<div id="login-screen">
+  <div class="login-card">
+    <div class="login-logo">🖥</div>
+    <h1>PC管理コンソール</h1>
+    <p>管理者パスワードを入力してください</p>
+    <input type="password" id="password-input" placeholder="パスワード">
+    <button class="btn btn-primary" id="login-btn" style="width:100%;padding:11px;font-size:14px">ログイン</button>
+    <div id="login-error"></div>
+  </div>
+</div>
+
+<!-- メイン画面 -->
+<div id="main-screen">
+  <header>
+    <div class="logo">🖥 PC管理コンソール <span>v3</span></div>
+    <input type="search" id="search" class="header-search" placeholder="検索… (/)">
+    <div class="header-actions">
+      <button class="view-btn active" id="view-grid">⊞</button>
+      <button class="view-btn" id="view-list">≡</button>
+      <button class="btn btn-warn" id="lockall-btn">🔒 一斉ロック</button>
+      <button class="btn btn-success" id="unlockall-btn">🔓 一斉解除</button>
+      <button class="btn btn-primary" id="broadcast-btn">📢 一斉メッセージ</button>
+      <button class="btn btn-ghost" id="schedule-toggle">⏰ スケジュール</button>
+      <button class="btn btn-ghost" id="export-btn">↓ CSV</button>
+      <button class="btn btn-ghost" id="log-toggle">📋 ログ</button>
+    </div>
+    <div class="stats-row">
+      <div class="stat-chip">台数 <strong id="stat-total">0</strong></div>
+      <div class="stat-chip stat-online">オンライン <strong id="stat-online">0</strong></div>
+      <div class="stat-chip">オフライン <strong id="stat-offline">0</strong></div>
+      <div class="stat-chip stat-locked">ロック中 <strong id="stat-locked">0</strong></div>
+    </div>
+  </header>
+
+  <div id="group-filter"></div>
+
+  <div class="content">
+    <!-- デバイスグリッド -->
+    <div id="device-grid" class="device-grid"></div>
+
+    <!-- 詳細パネル -->
+    <div id="detail-panel">
+      <div class="detail-header">
+        <div class="detail-header-top">
+          <div style="flex:1">
+            <h2 id="detail-name">-</h2>
+            <div id="detail-status" class="status-off">-</div>
+          </div>
+          <button class="detail-close" id="detail-close">×</button>
+        </div>
+        <div class="detail-meta-row">
+          <span id="detail-id" class="mono">-</span>
+          <div id="detail-battery"></div>
+        </div>
+      </div>
+
+      <div class="detail-tabs">
+        <button class="tab-btn active" data-tab="info">情報</button>
+        <button class="tab-btn" data-tab="actions">操作</button>
+        <button class="tab-btn" data-tab="history">URL履歴</button>
+      </div>
+
+      <div class="detail-scroll" id="detail-tab-content"></div>
+
+      <div class="detail-footer">
+        <button class="btn btn-lock" id="lock-btn">🔒 ロックダウン</button>
+        <button class="btn btn-danger" id="delete-btn" style="width:100%">🗑 デバイスを削除</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ロックモーダル -->
+<div class="modal-overlay" id="lock-modal">
+  <div class="modal-card">
+    <h3>🔒 ロックダウン</h3>
+    <p>PCの画面をロックし、メッセージを表示します</p>
+    <textarea id="lock-message-input" placeholder="このパソコンは管理者によってロックされています。"></textarea>
+    <div class="modal-btns">
+      <button id="lock-cancel-btn" style="background:var(--surface2);color:var(--text)">キャンセル</button>
+      <button id="lock-send-btn" style="background:var(--red);color:#fff">ロックする</button>
+    </div>
+  </div>
+</div>
+
+<!-- 一斉メッセージモーダル -->
+<div class="modal-overlay" id="broadcast-modal">
+  <div class="modal-card">
+    <h3>📢 一斉メッセージ</h3>
+    <p>現在のフィルター対象のオンラインデバイスに一斉送信します</p>
+    <textarea id="broadcast-input" placeholder="送信するメッセージを入力"></textarea>
+    <div class="modal-btns">
+      <button id="broadcast-cancel-btn" style="background:var(--surface2);color:var(--text)">キャンセル</button>
+      <button id="broadcast-send-btn" style="background:var(--accent);color:#fff">送信する</button>
+    </div>
+  </div>
+</div>
+
+<!-- スケジュールタスクモーダル -->
+<div class="modal-overlay" id="task-modal">
+  <div class="modal-card">
+    <h3>⏰ スケジュール追加</h3>
+    <p>指定した時刻に自動でアクションを実行します</p>
+    <label class="modal-label">タスク名</label>
+    <input type="text" id="task-name-input" placeholder="例: 授業終了ロック">
+    <label class="modal-label">実行時刻</label>
+    <input type="time" id="task-time-input">
+    <label class="modal-label">曜日（未選択で毎日）</label>
+    <div class="day-checks">
+      ${["日","月","火","水","木","金","土"].map((d, i) => `<label class="day-check-label">${d}<input type="checkbox" class="day-check" value="${i}"></label>`).join("")}
+    </div>
+    <label class="modal-label">アクション</label>
+    <select id="task-action-sel">
+      <option value="lock">🔒 ロックダウン</option>
+      <option value="unlock">🔓 ロック解除</option>
+      <option value="message">💬 メッセージ送信</option>
+    </select>
+    <label class="modal-label">対象グループ</label>
+    <select id="task-group-sel"><option value="all">すべて</option></select>
+    <label class="modal-label">メッセージ（ロック時 / メッセージ送信時）</label>
+    <input type="text" id="task-msg-input" placeholder="例: 授業を終了します。">
+    <div class="modal-btns">
+      <button id="task-cancel-btn" style="background:var(--surface2);color:var(--text)">キャンセル</button>
+      <button id="task-save-btn" style="background:var(--accent);color:#fff">保存する</button>
+    </div>
+  </div>
+</div>
+
+<!-- アクティビティログ -->
+<div id="log-panel">
+  <div class="log-header">
+    <h3>📋 アクティビティログ</h3>
+    <button class="btn btn-sm btn-ghost" id="log-clear">クリア</button>
+    <button class="icon-btn" id="log-close" onclick="document.getElementById('log-panel').classList.remove('open')">×</button>
+  </div>
+  <div id="log-list"></div>
+</div>
+
+<!-- スケジュールパネル -->
+<div id="schedule-panel">
+  <div class="panel-header">
+    <h3>⏰ スケジュール管理</h3>
+    <button class="btn btn-sm btn-primary" id="add-task-btn">＋ 追加</button>
+    <button class="icon-btn" onclick="document.getElementById('schedule-panel').classList.remove('open')">×</button>
+  </div>
+  <div id="task-list"></div>
+</div>
+
+<div id="toast-area"></div>
+</body>
+</html>
