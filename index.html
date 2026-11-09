@@ -232,6 +232,9 @@
         const alive = isOnline(d.lastSeen);
         const locked = d.locked;
         const hasMsg = !!d.pendingMessage;
+        const hasImage = !!d.showImageUrl;
+        const hasAudio = !!d.playAudioUrl;
+        const hasTimer = !!d.countdownEnd;
         const batteryVal = d.battery ?? null;
 
         if (viewMode === "list") {
@@ -246,6 +249,9 @@
             <div class="list-badges">
               ${locked ? '<span class="badge badge-red">ロック</span>' : ''}
               ${hasMsg ? '<span class="badge badge-blue">メッセージ</span>' : ''}
+              ${hasImage ? '<span class="badge badge-purple">🖼️</span>' : ''}
+              ${hasAudio ? '<span class="badge badge-purple">🔊</span>' : ''}
+              ${hasTimer ? '<span class="badge badge-orange">⏱</span>' : ''}
               ${batteryVal !== null ? `<span class="badge badge-${batteryVal < 20 ? 'red' : 'muted'}">${batteryVal}%</span>` : ''}
             </div>
             <span class="list-time" data-ts="${d.lastSeen}">${timeSince(d.lastSeen)}</span>
@@ -270,6 +276,9 @@
                 <div class="card-badges">
                   ${locked ? '<span class="badge badge-red">ロック</span>' : ''}
                   ${hasMsg ? '<span class="badge badge-blue">📨</span>' : ''}
+                  ${hasImage ? '<span class="badge badge-purple">🖼️</span>' : ''}
+                  ${hasAudio ? '<span class="badge badge-purple">🔊</span>' : ''}
+                  ${hasTimer ? '<span class="badge badge-orange">⏱</span>' : ''}
                 </div>
               </div>
               <div class="card-info">
@@ -444,6 +453,28 @@
             <button class="btn btn-sm btn-primary" id="open-url-btn">送信</button>
           </div>
           <div class="detail-section-gap"></div>
+          <div class="section-title">🖼️ 画像を表示させる</div>
+          <div class="input-row">
+            <input type="url" id="show-image-input" placeholder="画像のURL (https://...)" value="${d.showImageUrl || ""}">
+            <button class="btn btn-sm btn-primary" id="show-image-btn">表示</button>
+          </div>
+          <button class="btn btn-sm" id="clear-image-btn" style="margin-top:4px;width:100%">🗑 画像をクリア</button>
+          <div class="detail-section-gap"></div>
+          <div class="section-title">🔊 音声を再生させる</div>
+          <div class="input-row">
+            <input type="url" id="play-audio-input" placeholder="音声ファイルのURL (https://...)" value="${d.playAudioUrl || ""}">
+            <button class="btn btn-sm btn-primary" id="play-audio-btn">再生</button>
+          </div>
+          <div class="input-row" style="margin-top:4px;align-items:center;gap:10px;">
+            <label style="font-size:12px;color:var(--muted);display:flex;align-items:center;gap:5px;">
+              <input type="checkbox" id="audio-loop-chk" ${d.playAudioLoop ? "checked" : ""}> ループ
+            </label>
+            <label style="font-size:12px;color:var(--muted);display:flex;align-items:center;gap:5px;">
+              音量 <input type="range" id="audio-vol" min="0" max="1" step="0.1" value="${d.audioVolume != null ? d.audioVolume : 1}" style="width:80px;">
+            </label>
+          </div>
+          <button class="btn btn-sm" id="stop-audio-btn" style="margin-top:4px;width:100%">⏹ 音声を停止</button>
+          <div class="detail-section-gap"></div>
           <div class="section-title">Ping</div>
           <button class="btn btn-sm" id="ping-btn" style="width:100%">📡 Pingを送る</button>
           <div id="ping-result" class="ping-result"></div>
@@ -472,6 +503,33 @@
           update(ref(db, `devices/${id}`), { openUrl: url, openUrlTs: Date.now() });
           showToast("URLを送信しました");
           addLog("msg", id, d.label || id, `URLを送信: ${url}`);
+        });
+        // 画像表示
+        document.getElementById("show-image-btn").addEventListener("click", () => {
+          const url = document.getElementById("show-image-input").value.trim();
+          if (!url) return;
+          update(ref(db, `devices/${id}`), { showImageUrl: url, showImageTs: Date.now() });
+          showToast("🖼️ 画像を送信しました");
+          addLog("msg", id, d.label || id, `画像を表示: ${url}`);
+        });
+        document.getElementById("clear-image-btn").addEventListener("click", () => {
+          update(ref(db, `devices/${id}`), { showImageUrl: null, showImageTs: null });
+          document.getElementById("show-image-input").value = "";
+          showToast("画像をクリアしました");
+        });
+        // 音声再生
+        document.getElementById("play-audio-btn").addEventListener("click", () => {
+          const url = document.getElementById("play-audio-input").value.trim();
+          if (!url) return;
+          const loop = document.getElementById("audio-loop-chk").checked;
+          const vol = parseFloat(document.getElementById("audio-vol").value);
+          update(ref(db, `devices/${id}`), { playAudioUrl: url, playAudioTs: Date.now(), playAudioLoop: loop, audioVolume: vol });
+          showToast("🔊 音声を送信しました");
+          addLog("msg", id, d.label || id, `音声を再生: ${url}`);
+        });
+        document.getElementById("stop-audio-btn").addEventListener("click", () => {
+          update(ref(db, `devices/${id}`), { playAudioUrl: null, playAudioTs: null });
+          showToast("音声を停止しました");
         });
         document.getElementById("ping-btn").addEventListener("click", () => {
           pingDevice(id);
@@ -588,6 +646,80 @@
 
     document.getElementById("broadcast-cancel-btn").addEventListener("click", () => {
       document.getElementById("broadcast-modal").style.display = "none";
+    });
+
+    // ===== 一斉画像表示 =====
+    document.getElementById("broadcast-image-btn").addEventListener("click", () => {
+      document.getElementById("broadcast-image-modal").style.display = "flex";
+    });
+    document.getElementById("broadcast-image-send-btn").addEventListener("click", () => {
+      const url = document.getElementById("broadcast-image-input").value.trim();
+      if (!url) return;
+      let count = 0;
+      Object.entries(allDevices).forEach(([id, d]) => {
+        if (currentFilter === "all" || d.group === currentFilter) {
+          if (isOnline(d.lastSeen)) {
+            update(ref(db, `devices/${id}`), { showImageUrl: url, showImageTs: Date.now() });
+            count++;
+          }
+        }
+      });
+      showToast(`🖼️ ${count}台に画像を送信しました`);
+      addLog("msg", "all", "全体", `一斉画像表示: ${url}`);
+      document.getElementById("broadcast-image-modal").style.display = "none";
+      document.getElementById("broadcast-image-input").value = "";
+    });
+    document.getElementById("broadcast-image-cancel-btn").addEventListener("click", () => {
+      document.getElementById("broadcast-image-modal").style.display = "none";
+    });
+    document.getElementById("broadcast-image-clear-btn").addEventListener("click", () => {
+      let count = 0;
+      Object.entries(allDevices).forEach(([id, d]) => {
+        if (currentFilter === "all" || d.group === currentFilter) {
+          update(ref(db, `devices/${id}`), { showImageUrl: null, showImageTs: null });
+          count++;
+        }
+      });
+      showToast(`${count}台の画像をクリアしました`);
+      document.getElementById("broadcast-image-modal").style.display = "none";
+    });
+
+    // ===== 一斉音声再生 =====
+    document.getElementById("broadcast-audio-btn").addEventListener("click", () => {
+      document.getElementById("broadcast-audio-modal").style.display = "flex";
+    });
+    document.getElementById("broadcast-audio-send-btn").addEventListener("click", () => {
+      const url = document.getElementById("broadcast-audio-input").value.trim();
+      if (!url) return;
+      const loop = document.getElementById("broadcast-audio-loop").checked;
+      const vol = parseFloat(document.getElementById("broadcast-audio-vol").value);
+      let count = 0;
+      Object.entries(allDevices).forEach(([id, d]) => {
+        if (currentFilter === "all" || d.group === currentFilter) {
+          if (isOnline(d.lastSeen)) {
+            update(ref(db, `devices/${id}`), { playAudioUrl: url, playAudioTs: Date.now(), playAudioLoop: loop, audioVolume: vol });
+            count++;
+          }
+        }
+      });
+      showToast(`🔊 ${count}台に音声を送信しました`);
+      addLog("msg", "all", "全体", `一斉音声再生: ${url}`);
+      document.getElementById("broadcast-audio-modal").style.display = "none";
+      document.getElementById("broadcast-audio-input").value = "";
+    });
+    document.getElementById("broadcast-audio-cancel-btn").addEventListener("click", () => {
+      document.getElementById("broadcast-audio-modal").style.display = "none";
+    });
+    document.getElementById("broadcast-audio-stop-btn").addEventListener("click", () => {
+      let count = 0;
+      Object.entries(allDevices).forEach(([id, d]) => {
+        if (currentFilter === "all" || d.group === currentFilter) {
+          update(ref(db, `devices/${id}`), { playAudioUrl: null, playAudioTs: null });
+          count++;
+        }
+      });
+      showToast(`${count}台の音声を停止しました`);
+      document.getElementById("broadcast-audio-modal").style.display = "none";
     });
 
     // ===== Ping =====
@@ -746,17 +878,28 @@
       sel.innerHTML = `<option value="all">すべて</option>` + [...groups].map(g => `<option value="${g}">${g}</option>`).join("");
     });
 
+    function updateTaskFields() {
+      const action = document.getElementById("task-action-sel").value;
+      document.getElementById("task-msg-wrap").style.display = ["lock","message"].includes(action) ? "" : "none";
+      document.getElementById("task-image-wrap").style.display = action === "show_image" ? "" : "none";
+      document.getElementById("task-audio-wrap").style.display = action === "play_audio" ? "" : "none";
+    }
+    window.updateTaskFields = updateTaskFields;
+
     document.getElementById("task-save-btn").addEventListener("click", () => {
       const name = document.getElementById("task-name-input").value.trim() || "タスク";
       const time = document.getElementById("task-time-input").value;
       const action = document.getElementById("task-action-sel").value;
       const group = document.getElementById("task-group-sel").value;
-      const message = document.getElementById("task-msg-input").value.trim();
+      const message = document.getElementById("task-msg-input")?.value.trim();
+      const imageUrl = document.getElementById("task-image-input")?.value.trim();
+      const audioUrl = document.getElementById("task-audio-input")?.value.trim();
+      const audioLoop = document.getElementById("task-audio-loop")?.checked;
       const dayChecks = [...document.querySelectorAll(".day-check:checked")].map(c => parseInt(c.value));
 
       if (!time) { showToast("時刻を設定してください"); return; }
 
-      scheduledTasks.push({ name, time, action, group, message, days: dayChecks.length ? dayChecks : null, enabled: true });
+      scheduledTasks.push({ name, time, action, group, message, imageUrl, audioUrl, audioLoop, days: dayChecks.length ? dayChecks : null, enabled: true });
       saveScheduledTasks();
       renderScheduledTasks();
       document.getElementById("task-modal").style.display = "none";
@@ -790,6 +933,126 @@
         document.getElementById("search").focus();
       }
     });
+
+    // ===== 一括リセット =====
+    document.getElementById("reset-all-btn").addEventListener("click", () => {
+      document.getElementById("reset-modal").style.display = "flex";
+    });
+    document.getElementById("reset-confirm-btn").addEventListener("click", () => {
+      const targets = Object.entries(allDevices).filter(([id, d]) => currentFilter === "all" || d.group === currentFilter);
+      targets.forEach(([id]) => {
+        update(ref(db, `devices/${id}`), {
+          pendingMessage: null, messageTs: null,
+          showImageUrl: null, showImageTs: null,
+          playAudioUrl: null, playAudioTs: null,
+          countdownEnd: null, countdownLabel: null
+        });
+      });
+      showToast(`🧹 ${targets.length}台をリセットしました`);
+      addLog("edit", "all", "全体", `一括リセット: ${targets.length}台`);
+      document.getElementById("reset-modal").style.display = "none";
+    });
+    document.getElementById("reset-cancel-btn").addEventListener("click", () => {
+      document.getElementById("reset-modal").style.display = "none";
+    });
+
+    // ===== 全体Ping =====
+    document.getElementById("pingall-btn").addEventListener("click", () => {
+      const ts = Date.now();
+      let count = 0;
+      Object.entries(allDevices).forEach(([id, d]) => {
+        if (currentFilter === "all" || d.group === currentFilter) {
+          if (isOnline(d.lastSeen)) {
+            update(ref(db, `devices/${id}`), { pingRequest: ts });
+            count++;
+          }
+        }
+      });
+      showToast(`📡 ${count}台に一括Pingを送信しました`);
+      addLog("ping", "all", "全体", `一括Ping: ${count}台`);
+    });
+
+    // ===== カウントダウンタイマー =====
+    document.getElementById("countdown-btn").addEventListener("click", () => {
+      document.getElementById("countdown-modal").style.display = "flex";
+    });
+    document.getElementById("countdown-send-btn").addEventListener("click", () => {
+      const mins = parseInt(document.getElementById("countdown-mins").value) || 0;
+      const secs = parseInt(document.getElementById("countdown-secs").value) || 0;
+      const label = document.getElementById("countdown-label").value.trim() || "残り時間";
+      const total = mins * 60 + secs;
+      if (total <= 0) { showToast("時間を設定してください"); return; }
+      const endTs = Date.now() + total * 1000;
+      let count = 0;
+      Object.entries(allDevices).forEach(([id, d]) => {
+        if (currentFilter === "all" || d.group === currentFilter) {
+          if (isOnline(d.lastSeen)) {
+            update(ref(db, `devices/${id}`), { countdownEnd: endTs, countdownLabel: label });
+            count++;
+          }
+        }
+      });
+      showToast(`⏱ ${count}台にタイマーを送信しました`);
+      addLog("msg", "all", "全体", `タイマー送信: ${label} ${mins}分${secs}秒`);
+      document.getElementById("countdown-modal").style.display = "none";
+    });
+    document.getElementById("countdown-stop-btn").addEventListener("click", () => {
+      let count = 0;
+      Object.entries(allDevices).forEach(([id, d]) => {
+        if (currentFilter === "all" || d.group === currentFilter) {
+          update(ref(db, `devices/${id}`), { countdownEnd: null, countdownLabel: null });
+          count++;
+        }
+      });
+      showToast(`${count}台のタイマーを停止しました`);
+      document.getElementById("countdown-modal").style.display = "none";
+    });
+    document.getElementById("countdown-cancel-btn").addEventListener("click", () => {
+      document.getElementById("countdown-modal").style.display = "none";
+    });
+
+    // ===== スケジュール拡張（画像・音声・タイマー） =====
+    // checkScheduledTasks内で画像・音声アクションも処理
+    const _origCheck = checkScheduledTasks;
+    // （既存のcheckScheduledTasksを拡張）
+    // 既存のscheduledTasksのaction処理を上書き（画像・音声追加）
+    function checkScheduledTasksExtended() {
+      const now = new Date();
+      const hhmm = `${String(now.getHours()).padStart(2,"0")}:${String(now.getMinutes()).padStart(2,"0")}`;
+      const day = now.getDay();
+      scheduledTasks.forEach(task => {
+        if (!task.enabled) return;
+        if (task.time !== hhmm) return;
+        if (task.days && !task.days.includes(day)) return;
+        const thisMinute = Math.floor(Date.now() / 60000);
+        if (task.lastRun === thisMinute) return;
+        task.lastRun = thisMinute;
+        saveScheduledTasks();
+        const targetDevices = Object.entries(allDevices).filter(([id, d]) => task.group === "all" || d.group === task.group);
+        if (task.action === "lock") {
+          targetDevices.forEach(([id]) => update(ref(db, `devices/${id}`), { locked: true, lockMessage: task.message || "管理者によってロックされました。" }));
+          showToast(`⏰ スケジュール: ${task.name} 実行`, "warn");
+        } else if (task.action === "unlock") {
+          targetDevices.forEach(([id]) => update(ref(db, `devices/${id}`), { locked: false, lockMessage: "" }));
+          showToast(`⏰ スケジュール: ${task.name} 実行`);
+        } else if (task.action === "message") {
+          targetDevices.forEach(([id]) => update(ref(db, `devices/${id}`), { pendingMessage: task.message, messageTs: Date.now() }));
+          showToast(`⏰ スケジュール: ${task.name} 実行`);
+        } else if (task.action === "show_image") {
+          targetDevices.forEach(([id]) => update(ref(db, `devices/${id}`), { showImageUrl: task.imageUrl, showImageTs: Date.now() }));
+          showToast(`⏰ スケジュール: ${task.name} 画像表示`);
+        } else if (task.action === "play_audio") {
+          targetDevices.forEach(([id]) => update(ref(db, `devices/${id}`), { playAudioUrl: task.audioUrl, playAudioTs: Date.now(), playAudioLoop: !!task.audioLoop }));
+          showToast(`⏰ スケジュール: ${task.name} 音声再生`);
+        } else if (task.action === "reset") {
+          targetDevices.forEach(([id]) => update(ref(db, `devices/${id}`), { pendingMessage: null, messageTs: null, showImageUrl: null, showImageTs: null, playAudioUrl: null, playAudioTs: null, countdownEnd: null, countdownLabel: null }));
+          showToast(`⏰ スケジュール: ${task.name} 一括リセット`);
+        }
+        addLog("schedule", "auto", task.name, `スケジュール実行: ${task.action}`);
+      });
+    }
+    // 既存のsetIntervalで呼ばれるcheckScheduledTasksを置き換え
+    window.checkScheduledTasks = checkScheduledTasksExtended;
   </script>
 
   <style>
@@ -943,6 +1206,8 @@
     .badge-red { background: rgba(241,89,107,.15); color: var(--red); }
     .badge-blue { background: rgba(91,141,238,.15); color: var(--accent); }
     .badge-muted { background: var(--surface2); color: var(--muted); }
+    .badge-purple { background: rgba(167,109,238,.15); color: #a76dee; }
+    .badge-orange { background: rgba(245,158,11,.15); color: var(--amber); }
 
     /* ===== 空状態 ===== */
     .empty-state { grid-column: 1/-1; text-align: center; color: var(--muted); padding: 60px 20px; font-size: 14px; }
@@ -1140,6 +1405,11 @@
       <button class="btn btn-warn" id="lockall-btn">🔒 一斉ロック</button>
       <button class="btn btn-success" id="unlockall-btn">🔓 一斉解除</button>
       <button class="btn btn-primary" id="broadcast-btn">📢 一斉メッセージ</button>
+      <button class="btn btn-primary" id="broadcast-image-btn">🖼️ 一斉画像</button>
+      <button class="btn btn-primary" id="broadcast-audio-btn">🔊 一斉音声</button>
+      <button class="btn btn-primary" id="countdown-btn">⏱ タイマー</button>
+      <button class="btn btn-warn" id="reset-all-btn">🧹 一括リセット</button>
+      <button class="btn btn-ghost" id="pingall-btn">📡 全体Ping</button>
       <button class="btn btn-ghost" id="schedule-toggle">⏰ スケジュール</button>
       <button class="btn btn-ghost" id="export-btn">↓ CSV</button>
       <button class="btn btn-ghost" id="log-toggle">📋 ログ</button>
@@ -1216,6 +1486,82 @@
   </div>
 </div>
 
+<!-- 一斉画像表示モーダル -->
+<div class="modal-overlay" id="broadcast-image-modal">
+  <div class="modal-card">
+    <h3>🖼️ 一斉画像表示</h3>
+    <p>現在のフィルター対象のオンラインデバイスに画像を表示します</p>
+    <label class="modal-label">画像URL</label>
+    <input type="url" id="broadcast-image-input" placeholder="https://example.com/image.jpg">
+    <div class="modal-btns">
+      <button id="broadcast-image-cancel-btn" style="background:var(--surface2);color:var(--text)">キャンセル</button>
+      <button id="broadcast-image-clear-btn" style="background:var(--surface2);color:var(--text)">🗑 一斉クリア</button>
+      <button id="broadcast-image-send-btn" style="background:var(--accent);color:#fff">表示する</button>
+    </div>
+  </div>
+</div>
+
+<!-- 一斉音声再生モーダル -->
+<div class="modal-overlay" id="broadcast-audio-modal">
+  <div class="modal-card">
+    <h3>🔊 一斉音声再生</h3>
+    <p>現在のフィルター対象のオンラインデバイスで音声を再生します</p>
+    <label class="modal-label">音声ファイルURL</label>
+    <input type="url" id="broadcast-audio-input" placeholder="https://example.com/sound.mp3">
+    <div style="display:flex;gap:16px;align-items:center;margin-bottom:12px;">
+      <label style="font-size:12px;color:var(--muted);display:flex;align-items:center;gap:5px;">
+        <input type="checkbox" id="broadcast-audio-loop"> ループ再生
+      </label>
+      <label style="font-size:12px;color:var(--muted);display:flex;align-items:center;gap:6px;">
+        音量 <input type="range" id="broadcast-audio-vol" min="0" max="1" step="0.1" value="1" style="width:80px;">
+      </label>
+    </div>
+    <div class="modal-btns">
+      <button id="broadcast-audio-cancel-btn" style="background:var(--surface2);color:var(--text)">キャンセル</button>
+      <button id="broadcast-audio-stop-btn" style="background:var(--surface2);color:var(--text)">⏹ 一斉停止</button>
+      <button id="broadcast-audio-send-btn" style="background:var(--accent);color:#fff">再生する</button>
+    </div>
+  </div>
+</div>
+
+<!-- 一括リセットモーダル -->
+<div class="modal-overlay" id="reset-modal">
+  <div class="modal-card">
+    <h3>🧹 一括リセット</h3>
+    <p>現在のフィルター対象の全デバイスのメッセージ・画像・音声・タイマーを一括消去します。よろしいですか？</p>
+    <div class="modal-btns">
+      <button id="reset-cancel-btn" style="background:var(--surface2);color:var(--text)">キャンセル</button>
+      <button id="reset-confirm-btn" style="background:var(--red);color:#fff">リセット実行</button>
+    </div>
+  </div>
+</div>
+
+<!-- カウントダウンタイマーモーダル -->
+<div class="modal-overlay" id="countdown-modal">
+  <div class="modal-card">
+    <h3>⏱ カウントダウンタイマー</h3>
+    <p>現在のフィルター対象のオンラインデバイスに残り時間を表示します</p>
+    <label class="modal-label">タイマーラベル</label>
+    <input type="text" id="countdown-label" placeholder="例: 試験終了まで" value="残り時間">
+    <label class="modal-label">時間設定</label>
+    <div style="display:flex;gap:10px;margin-bottom:12px;">
+      <div style="flex:1">
+        <div style="font-size:11px;color:var(--muted);margin-bottom:4px;">分</div>
+        <input type="number" id="countdown-mins" min="0" max="99" value="5" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:10px 12px;border-radius:8px;font-size:14px;outline:none;text-align:center;">
+      </div>
+      <div style="flex:1">
+        <div style="font-size:11px;color:var(--muted);margin-bottom:4px;">秒</div>
+        <input type="number" id="countdown-secs" min="0" max="59" value="0" style="width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:10px 12px;border-radius:8px;font-size:14px;outline:none;text-align:center;">
+      </div>
+    </div>
+    <div class="modal-btns">
+      <button id="countdown-cancel-btn" style="background:var(--surface2);color:var(--text)">キャンセル</button>
+      <button id="countdown-stop-btn" style="background:var(--surface2);color:var(--text)">⏹ 停止</button>
+      <button id="countdown-send-btn" style="background:var(--accent);color:#fff">送信する</button>
+    </div>
+  </div>
+</div>
+
 <!-- スケジュールタスクモーダル -->
 <div class="modal-overlay" id="task-modal">
   <div class="modal-card">
@@ -1230,15 +1576,31 @@
       ${["日","月","火","水","木","金","土"].map((d, i) => `<label class="day-check-label">${d}<input type="checkbox" class="day-check" value="${i}"></label>`).join("")}
     </div>
     <label class="modal-label">アクション</label>
-    <select id="task-action-sel">
+    <select id="task-action-sel" onchange="updateTaskFields()">
       <option value="lock">🔒 ロックダウン</option>
       <option value="unlock">🔓 ロック解除</option>
       <option value="message">💬 メッセージ送信</option>
+      <option value="show_image">🖼️ 画像表示</option>
+      <option value="play_audio">🔊 音声再生</option>
+      <option value="reset">🧹 一括リセット</option>
     </select>
     <label class="modal-label">対象グループ</label>
     <select id="task-group-sel"><option value="all">すべて</option></select>
-    <label class="modal-label">メッセージ（ロック時 / メッセージ送信時）</label>
-    <input type="text" id="task-msg-input" placeholder="例: 授業を終了します。">
+    <div id="task-msg-wrap">
+      <label class="modal-label">メッセージ（ロック時 / メッセージ送信時）</label>
+      <input type="text" id="task-msg-input" placeholder="例: 授業を終了します。">
+    </div>
+    <div id="task-image-wrap" style="display:none">
+      <label class="modal-label">画像URL</label>
+      <input type="url" id="task-image-input" placeholder="https://example.com/image.jpg">
+    </div>
+    <div id="task-audio-wrap" style="display:none">
+      <label class="modal-label">音声URL</label>
+      <input type="url" id="task-audio-input" placeholder="https://example.com/sound.mp3">
+      <label style="font-size:12px;color:var(--muted);display:flex;align-items:center;gap:5px;margin-bottom:8px;">
+        <input type="checkbox" id="task-audio-loop"> ループ再生
+      </label>
+    </div>
     <div class="modal-btns">
       <button id="task-cancel-btn" style="background:var(--surface2);color:var(--text)">キャンセル</button>
       <button id="task-save-btn" style="background:var(--accent);color:#fff">保存する</button>
