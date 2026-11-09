@@ -124,6 +124,9 @@
 
     let currentlyLocked = false;
     let openUrlHandled = 0;
+    let showImageHandled = 0;
+    let playAudioHandled = 0;
+    let countdownInterval = null;
 
     onValue(ref(db, `devices/${deviceId}`), snap => {
       const data = snap.val();
@@ -159,9 +162,45 @@
         location.href = data.openUrl;
       }
 
+      // 画像表示
+      if (data.showImageUrl && data.showImageTs && data.showImageTs > showImageHandled) {
+        showImageHandled = data.showImageTs;
+        const overlay = document.getElementById("image-overlay");
+        const imgEl = document.getElementById("overlay-img");
+        imgEl.src = data.showImageUrl;
+        overlay.style.display = "flex";
+      } else if (!data.showImageUrl) {
+        document.getElementById("image-overlay").style.display = "none";
+      }
+
+      // 音声再生
+      if (data.playAudioUrl && data.playAudioTs && data.playAudioTs > playAudioHandled) {
+        playAudioHandled = data.playAudioTs;
+        const audio = document.getElementById("bg-audio");
+        audio.src = data.playAudioUrl;
+        audio.loop = !!data.playAudioLoop;
+        audio.volume = data.audioVolume != null ? data.audioVolume : 1.0;
+        audio.play().catch(() => {
+          // 自動再生ブロック時はユーザー操作後に再生
+          document.addEventListener("click", () => audio.play(), { once: true });
+        });
+      } else if (!data.playAudioUrl) {
+        const audio = document.getElementById("bg-audio");
+        audio.pause();
+        audio.src = "";
+      }
+
       // Ping応答
       if (data.pingRequest && data.pingRequest > (data.pingResponse || 0)) {
         update(ref(db, `devices/${deviceId}`), { pingResponse: Date.now() });
+      }
+
+      // カウントダウンタイマー
+      if (data.countdownEnd && data.countdownEnd > Date.now()) {
+        const label = data.countdownLabel || "残り時間";
+        startCountdown(data.countdownEnd, label);
+      } else {
+        stopCountdown();
       }
     });
 
@@ -172,6 +211,38 @@
 
     document.getElementById("msg-close").addEventListener("click", () => {
       msgBanner.style.display = "none";
+    });
+
+    function startCountdown(endTs, label) {
+      const bar = document.getElementById("countdown-bar");
+      const labelEl = document.getElementById("countdown-label");
+      const timeEl = document.getElementById("countdown-time");
+      labelEl.textContent = label;
+      bar.style.display = "flex";
+      if (countdownInterval) clearInterval(countdownInterval);
+      function tick() {
+        const left = Math.max(0, Math.ceil((endTs - Date.now()) / 1000));
+        const m = Math.floor(left / 60);
+        const s = left % 60;
+        timeEl.textContent = `${String(m).padStart(2,"0")}:${String(s).padStart(2,"0")}`;
+        bar.classList.toggle("urgent", left <= 30);
+        if (left <= 0) {
+          stopCountdown();
+          update(ref(db, `devices/${deviceId}`), { countdownEnd: null });
+        }
+      }
+      tick();
+      countdownInterval = setInterval(tick, 500);
+    }
+
+    function stopCountdown() {
+      if (countdownInterval) { clearInterval(countdownInterval); countdownInterval = null; }
+      document.getElementById("countdown-bar").style.display = "none";
+    }
+
+    document.getElementById("image-close").addEventListener("click", () => {
+      document.getElementById("image-overlay").style.display = "none";
+      update(ref(db, `devices/${deviceId}`), { showImageUrl: null });
     });
 
     // ===== Service Worker =====
@@ -230,6 +301,39 @@
     #msg-text { flex: 1; }
     #msg-close { background: rgba(255,255,255,.2); border: none; color: #fff; font-size: 16px; cursor: pointer; border-radius: 50%; width: 24px; height: 24px; display: flex; align-items: center; justify-content: center; }
 
+    /* カウントダウンバー */
+    #countdown-bar {
+      display: none; position: fixed; top: 0; left: 0; right: 0;
+      background: #1a1a2e; color: #fff; padding: 10px 20px;
+      align-items: center; justify-content: center; gap: 14px;
+      z-index: 1500; font-size: 14px; font-weight: 600;
+      border-bottom: 2px solid var(--accent);
+    }
+    #countdown-time {
+      font-size: 26px; font-weight: 700; font-family: monospace;
+      color: var(--accent); letter-spacing: 2px;
+    }
+    #countdown-bar.urgent #countdown-time { color: #f1596b; animation: pulse2 .6s infinite; }
+    @keyframes pulse2 { 0%,100%{opacity:1} 50%{opacity:.4} }
+
+    /* 画像オーバーレイ */
+    #image-overlay {
+      display: none; position: fixed; inset: 0; background: rgba(0,0,0,.85);
+      flex-direction: column; align-items: center; justify-content: center;
+      z-index: 9000; padding: 20px;
+    }
+    #image-overlay img {
+      max-width: 100%; max-height: 85vh; border-radius: 12px;
+      box-shadow: 0 8px 40px rgba(0,0,0,.6); object-fit: contain;
+    }
+    #image-close {
+      position: absolute; top: 16px; right: 16px;
+      background: rgba(255,255,255,.15); border: none; color: #fff;
+      font-size: 22px; cursor: pointer; border-radius: 50%;
+      width: 40px; height: 40px; display: flex; align-items: center; justify-content: center;
+    }
+    #image-close:hover { background: rgba(255,255,255,.3); }
+
     /* エージェントカード */
     .card { background: var(--surface); border: 1px solid var(--border); border-radius: 18px; padding: 28px; max-width: 420px; width: 100%; }
     .card-header { display: flex; align-items: center; gap: 14px; margin-bottom: 20px; }
@@ -259,6 +363,21 @@
   </style>
 </head>
 <body>
+
+<!-- カウントダウンバー -->
+<div id="countdown-bar">
+  <span id="countdown-label">残り時間</span>
+  <span id="countdown-time">00:00</span>
+</div>
+
+<!-- 画像オーバーレイ -->
+<div id="image-overlay">
+  <button id="image-close">✕</button>
+  <img id="overlay-img" src="" alt="管理者から送信された画像">
+</div>
+
+<!-- 音声プレーヤー（非表示） -->
+<audio id="bg-audio" preload="none"></audio>
 
 <!-- ロック画面 -->
 <div id="lock-screen">
