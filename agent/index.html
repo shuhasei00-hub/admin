@@ -6,11 +6,15 @@
   <title>PC監視エージェント</title>
   <link rel="manifest" href="manifest.json">
   <meta name="theme-color" content="#5b8dee">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="監視エージェント">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
   <script type="module">
     import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
-    import { getDatabase, ref, set, update, onValue, push, serverTimestamp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-database.js";
+    import { getDatabase, ref, set, update, onValue, push } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-database.js";
 
     const firebaseConfig = {
       apiKey: "AIzaSyDp06yKrhhvRypue_iCfTzfqCbQEB9mCY4",
@@ -44,13 +48,11 @@
       else if (ua.includes("Linux")) os = "Linux";
       else if (ua.includes("Android")) os = "Android";
       else if (ua.includes("iPhone") || ua.includes("iPad")) os = "iOS";
-
       let browser = "不明";
       if (ua.includes("Edg/")) browser = "Edge";
       else if (ua.includes("Chrome/")) browser = "Chrome";
       else if (ua.includes("Firefox/")) browser = "Firefox";
       else if (ua.includes("Safari/")) browser = "Safari";
-
       return { os, browser };
     }
 
@@ -62,7 +64,6 @@
       } catch { return "取得失敗"; }
     }
 
-    // ===== バッテリー情報 =====
     async function getBattery() {
       try {
         const bat = await navigator.getBattery();
@@ -94,11 +95,8 @@
         lastSeen: Date.now(),
         ...(battery !== null ? { battery } : {})
       };
-
-      // 既存データを上書きしないフィールドはupdate
       await update(ref(db, `devices/${deviceId}`), data);
       setStatus(`送信: ${new Date().toLocaleTimeString("ja-JP")}`);
-
       if (battery !== null) {
         document.getElementById("device-battery").textContent = `🔋 ${battery}%`;
         document.getElementById("device-battery").style.display = "inline";
@@ -120,31 +118,37 @@
 
     // ===== Firebaseコマンド監視 =====
     const lockScreen = document.getElementById("lock-screen");
+    const lockTimeEl = document.getElementById("lock-time");
     const msgBanner = document.getElementById("msg-banner");
 
-    let currentlyLocked = false;
-    let openUrlHandled = 0;
-    let showImageHandled = 0;
-    let playAudioHandled = 0;
+    // タイムスタンプは localStorage で永続化（ページリロード後も再実行しない）
+    let openUrlHandled   = parseInt(localStorage.getItem("lastOpenUrlTs")   || "0");
+    let showImageHandled = parseInt(localStorage.getItem("lastShowImageTs") || "0");
+    let playAudioHandled = parseInt(localStorage.getItem("lastPlayAudioTs") || "0");
     let countdownInterval = null;
+
+    // ロック時計
+    setInterval(() => {
+      if (lockScreen.style.display === "flex") {
+        lockTimeEl.textContent = new Date().toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+      }
+    }, 1000);
 
     onValue(ref(db, `devices/${deviceId}`), snap => {
       const data = snap.val();
       if (!data) return;
 
-      // ロックダウン
-      if (data.locked && !currentlyLocked) {
-        currentlyLocked = true;
+      // ===== ロックダウン =====
+      if (data.locked) {
         lockScreen.style.display = "flex";
         document.getElementById("lock-msg").textContent = data.lockMessage || "このパソコンは管理者によってロックされています。";
         // ロック中は離脱・戻るをブロック
         history.pushState(null, "", location.href);
-      } else if (!data.locked && currentlyLocked) {
-        currentlyLocked = false;
+      } else {
         lockScreen.style.display = "none";
       }
 
-      // メッセージ表示
+      // ===== メッセージ表示 =====
       if (data.pendingMessage && data.messageTs) {
         const lastShown = parseInt(localStorage.getItem("lastMsgTs") || "0");
         if (data.messageTs > lastShown) {
@@ -156,32 +160,33 @@
         msgBanner.style.display = "none";
       }
 
-      // URL誘導
+      // ===== URL誘導 =====
       if (data.openUrl && data.openUrlTs && data.openUrlTs > openUrlHandled) {
         openUrlHandled = data.openUrlTs;
+        localStorage.setItem("lastOpenUrlTs", openUrlHandled);
         location.href = data.openUrl;
       }
 
-      // 画像表示
+      // ===== 画像表示 =====
       if (data.showImageUrl && data.showImageTs && data.showImageTs > showImageHandled) {
         showImageHandled = data.showImageTs;
+        localStorage.setItem("lastShowImageTs", showImageHandled);
         const overlay = document.getElementById("image-overlay");
-        const imgEl = document.getElementById("overlay-img");
-        imgEl.src = data.showImageUrl;
+        document.getElementById("overlay-img").src = data.showImageUrl;
         overlay.style.display = "flex";
       } else if (!data.showImageUrl) {
         document.getElementById("image-overlay").style.display = "none";
       }
 
-      // 音声再生
+      // ===== 音声再生 =====
       if (data.playAudioUrl && data.playAudioTs && data.playAudioTs > playAudioHandled) {
         playAudioHandled = data.playAudioTs;
+        localStorage.setItem("lastPlayAudioTs", playAudioHandled);
         const audio = document.getElementById("bg-audio");
         audio.src = data.playAudioUrl;
         audio.loop = !!data.playAudioLoop;
         audio.volume = data.audioVolume != null ? data.audioVolume : 1.0;
         audio.play().catch(() => {
-          // 自動再生ブロック時はユーザー操作後に再生
           document.addEventListener("click", () => audio.play(), { once: true });
         });
       } else if (!data.playAudioUrl) {
@@ -190,41 +195,50 @@
         audio.src = "";
       }
 
-      // Ping応答
+      // ===== Ping応答 =====
       if (data.pingRequest && data.pingRequest > (data.pingResponse || 0)) {
         update(ref(db, `devices/${deviceId}`), { pingResponse: Date.now() });
       }
 
-      // カウントダウンタイマー
+      // ===== カウントダウンタイマー =====
       if (data.countdownEnd && data.countdownEnd > Date.now()) {
-        const label = data.countdownLabel || "残り時間";
-        startCountdown(data.countdownEnd, label);
+        startCountdown(data.countdownEnd, data.countdownLabel || "残り時間");
       } else {
         stopCountdown();
       }
     });
 
-    // ロック中の戻るボタンブロック
+    // ロック中の戻るボタン・離脱ブロック
     window.addEventListener("popstate", () => {
-      if (currentlyLocked) history.pushState(null, "", location.href);
+      if (lockScreen.style.display === "flex") history.pushState(null, "", location.href);
+    });
+    window.addEventListener("beforeunload", e => {
+      if (lockScreen.style.display === "flex") { e.preventDefault(); e.returnValue = ""; }
     });
 
+    // メッセージバナーを閉じる
     document.getElementById("msg-close").addEventListener("click", () => {
       msgBanner.style.display = "none";
     });
 
+    // 画像オーバーレイを閉じる
+    document.getElementById("image-close").addEventListener("click", () => {
+      document.getElementById("image-overlay").style.display = "none";
+      update(ref(db, `devices/${deviceId}`), { showImageUrl: null });
+    });
+
+    // ===== カウントダウン =====
     function startCountdown(endTs, label) {
       const bar = document.getElementById("countdown-bar");
-      const labelEl = document.getElementById("countdown-label");
-      const timeEl = document.getElementById("countdown-time");
-      labelEl.textContent = label;
+      document.getElementById("countdown-label").textContent = label;
       bar.style.display = "flex";
       if (countdownInterval) clearInterval(countdownInterval);
       function tick() {
         const left = Math.max(0, Math.ceil((endTs - Date.now()) / 1000));
         const m = Math.floor(left / 60);
         const s = left % 60;
-        timeEl.textContent = `${String(m).padStart(2,"0")}:${String(s).padStart(2,"0")}`;
+        document.getElementById("countdown-time").textContent =
+          `${String(m).padStart(2,"0")}:${String(s).padStart(2,"0")}`;
         bar.classList.toggle("urgent", left <= 30);
         if (left <= 0) {
           stopCountdown();
@@ -240,12 +254,7 @@
       document.getElementById("countdown-bar").style.display = "none";
     }
 
-    document.getElementById("image-close").addEventListener("click", () => {
-      document.getElementById("image-overlay").style.display = "none";
-      update(ref(db, `devices/${deviceId}`), { showImageUrl: null });
-    });
-
-    // ===== Service Worker =====
+    // ===== Service Worker（PWA） =====
     if ("serviceWorker" in navigator) {
       navigator.serviceWorker.register("sw.js").catch(console.error);
     }
@@ -262,7 +271,6 @@
         setTimeout(() => ok.style.display = "none", 2000);
       }
     });
-
     document.getElementById("label-input").addEventListener("keydown", e => {
       if (e.key === "Enter") document.getElementById("save-label").click();
     });
@@ -281,18 +289,19 @@
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body { background: var(--bg); color: var(--text); font-family: 'Inter', system-ui, sans-serif; min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 24px; }
 
-    /* ロック画面 */
+    /* ===== ロック画面 ===== */
     #lock-screen {
       display: none; position: fixed; inset: 0; background: #000;
       flex-direction: column; align-items: center; justify-content: center;
-      z-index: 9999; text-align: center; padding: 40px; user-select: none;
+      z-index: 99999; text-align: center; padding: 40px; user-select: none;
+      pointer-events: all;
     }
-    .lock-icon { font-size: 72px; margin-bottom: 24px; animation: pulse 2s infinite; }
+    .lock-icon { font-size: 72px; margin-bottom: 16px; animation: pulse 2s infinite; }
     @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.6} }
-    #lock-msg { font-size: 20px; font-weight: 700; color: #fff; max-width: 500px; line-height: 1.6; }
-    .lock-time { font-size: 48px; font-weight: 700; color: #fff; margin-bottom: 10px; }
+    #lock-time { font-size: 52px; font-weight: 700; color: #fff; margin-bottom: 10px; font-variant-numeric: tabular-nums; letter-spacing: 2px; }
+    #lock-msg { font-size: 18px; font-weight: 600; color: rgba(255,255,255,.85); max-width: 500px; line-height: 1.6; margin-top: 10px; }
 
-    /* メッセージバナー */
+    /* ===== メッセージバナー ===== */
     #msg-banner {
       display: none; position: fixed; top: 0; left: 0; right: 0;
       background: var(--accent); color: #fff; padding: 12px 20px;
@@ -301,7 +310,7 @@
     #msg-text { flex: 1; }
     #msg-close { background: rgba(255,255,255,.2); border: none; color: #fff; font-size: 16px; cursor: pointer; border-radius: 50%; width: 24px; height: 24px; display: flex; align-items: center; justify-content: center; }
 
-    /* カウントダウンバー */
+    /* ===== カウントダウンバー ===== */
     #countdown-bar {
       display: none; position: fixed; top: 0; left: 0; right: 0;
       background: #1a1a2e; color: #fff; padding: 10px 20px;
@@ -309,23 +318,18 @@
       z-index: 1500; font-size: 14px; font-weight: 600;
       border-bottom: 2px solid var(--accent);
     }
-    #countdown-time {
-      font-size: 26px; font-weight: 700; font-family: monospace;
-      color: var(--accent); letter-spacing: 2px;
-    }
-    #countdown-bar.urgent #countdown-time { color: #f1596b; animation: pulse2 .6s infinite; }
-    @keyframes pulse2 { 0%,100%{opacity:1} 50%{opacity:.4} }
+    #countdown-time { font-size: 26px; font-weight: 700; font-family: monospace; color: var(--accent); letter-spacing: 2px; }
+    #countdown-bar.urgent { border-bottom-color: var(--red); }
+    #countdown-bar.urgent #countdown-time { color: var(--red); animation: blink2 .6s infinite; }
+    @keyframes blink2 { 0%,100%{opacity:1} 50%{opacity:.3} }
 
-    /* 画像オーバーレイ */
+    /* ===== 画像オーバーレイ ===== */
     #image-overlay {
-      display: none; position: fixed; inset: 0; background: rgba(0,0,0,.85);
+      display: none; position: fixed; inset: 0; background: rgba(0,0,0,.88);
       flex-direction: column; align-items: center; justify-content: center;
       z-index: 9000; padding: 20px;
     }
-    #image-overlay img {
-      max-width: 100%; max-height: 85vh; border-radius: 12px;
-      box-shadow: 0 8px 40px rgba(0,0,0,.6); object-fit: contain;
-    }
+    #image-overlay img { max-width: 100%; max-height: 85vh; border-radius: 12px; box-shadow: 0 8px 40px rgba(0,0,0,.6); object-fit: contain; }
     #image-close {
       position: absolute; top: 16px; right: 16px;
       background: rgba(255,255,255,.15); border: none; color: #fff;
@@ -334,7 +338,7 @@
     }
     #image-close:hover { background: rgba(255,255,255,.3); }
 
-    /* エージェントカード */
+    /* ===== エージェントカード ===== */
     .card { background: var(--surface); border: 1px solid var(--border); border-radius: 18px; padding: 28px; max-width: 420px; width: 100%; }
     .card-header { display: flex; align-items: center; gap: 14px; margin-bottom: 20px; }
     .card-icon { font-size: 36px; }
@@ -343,12 +347,10 @@
     .badge { display: inline-flex; align-items: center; gap: 5px; background: rgba(45,212,160,.12); color: var(--green); border-radius: 20px; padding: 5px 14px; font-size: 12px; font-weight: 600; margin-bottom: 20px; }
     .badge-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--green); animation: blink 1.5s infinite; }
     @keyframes blink { 0%,100%{opacity:1} 50%{opacity:.3} }
-
     .info-section { background: var(--bg); border-radius: 10px; padding: 12px 14px; margin-bottom: 14px; }
     .info-row { display: flex; justify-content: space-between; font-size: 11px; padding: 3px 0; }
     .info-label { color: var(--muted); }
     .info-value { font-weight: 500; color: var(--text); }
-
     .input-section { background: var(--bg); border-radius: 10px; padding: 12px 14px; margin-bottom: 10px; }
     .section-label { font-size: 10px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .5px; margin-bottom: 8px; }
     .input-row { display: flex; gap: 8px; }
@@ -357,7 +359,6 @@
     .input-row button { background: var(--accent); color: #fff; border: none; padding: 8px 14px; border-radius: 8px; font-size: 13px; cursor: pointer; font-weight: 600; }
     #save-ok { color: var(--green); font-size: 12px; margin-left: 6px; display: none; }
     #device-battery { display: none; font-size: 11px; color: var(--muted); }
-
     #status { font-size: 10px; color: var(--muted); text-align: center; margin-top: 8px; }
     .device-id-label { font-size: 10px; color: var(--muted); text-align: center; margin-top: 4px; font-family: monospace; }
   </style>
@@ -370,25 +371,26 @@
   <span id="countdown-time">00:00</span>
 </div>
 
+<!-- メッセージバナー -->
+<div id="msg-banner">
+  <span id="msg-text"></span>
+  <button id="msg-close">×</button>
+</div>
+
+<!-- 音声プレーヤー（非表示） -->
+<audio id="bg-audio" preload="none"></audio>
+
 <!-- 画像オーバーレイ -->
 <div id="image-overlay">
   <button id="image-close">✕</button>
   <img id="overlay-img" src="" alt="管理者から送信された画像">
 </div>
 
-<!-- 音声プレーヤー（非表示） -->
-<audio id="bg-audio" preload="none"></audio>
-
-<!-- ロック画面 -->
+<!-- ロック画面（最前面） -->
 <div id="lock-screen">
   <div class="lock-icon">🔒</div>
+  <div id="lock-time">--:--:--</div>
   <div id="lock-msg">このパソコンは管理者によってロックされています。</div>
-</div>
-
-<!-- メッセージバナー -->
-<div id="msg-banner">
-  <span id="msg-text"></span>
-  <button id="msg-close">×</button>
 </div>
 
 <!-- エージェントカード -->
@@ -400,16 +402,13 @@
       <div class="sub">PC監視エージェント</div>
     </div>
   </div>
-
   <div class="badge"><span class="badge-dot"></span> 監視中</div>
-
   <div class="info-section">
     <div class="info-row"><span class="info-label">OS</span><span class="info-value" id="device-os">-</span></div>
     <div class="info-row"><span class="info-label">ブラウザ</span><span class="info-value" id="device-browser">-</span></div>
     <div class="info-row"><span class="info-label">解像度</span><span class="info-value" id="device-screen">-</span></div>
     <div class="info-row" style="margin-top:4px"><span id="device-battery"></span></div>
   </div>
-
   <div class="input-section">
     <div class="section-label">この端末の表示名</div>
     <div class="input-row">
@@ -418,7 +417,6 @@
       <span id="save-ok">✓</span>
     </div>
   </div>
-
   <div id="status">初期化中...</div>
   <div class="device-id-label">ID: <span id="device-id-text"></span></div>
 </div>
